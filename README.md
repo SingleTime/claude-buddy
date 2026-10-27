@@ -69,13 +69,15 @@ claude -p --input-format stream-json --output-format stream-json \
 
 1. **macOS 12+**（Apple Silicon 或 Intel）
 2. **Node.js 18+**
-3. **Claude Code CLI** 已安装并完成认证
+3. **Claude Code CLI** 已安装并完成认证 —— 没装也没关系，应用会引导你装（见下）
 
-```bash
-# 安装 Claude Code（任选其一）
-npm install -g @anthropic-ai/claude-code
-curl -fsSL https://claude.ai/install.sh | bash
-```
+> Claude Code 是 Anthropic 的闭源商业产品，**不随本仓库分发**。这个项目是它的前端，
+> 自己装一份即可，应用会自动找到。想手动装：
+>
+> ```bash
+> npm install -g @anthropic-ai/claude-code
+> curl -fsSL https://claude.ai/install.sh | bash
+> ```
 
 验证：
 
@@ -104,6 +106,20 @@ npm install
 > **注意**：如果终端里设了 `ELECTRON_RUN_AS_NODE=1`（某些 Electron 应用会往子进程注入），
 > 必须先 `unset ELECTRON_RUN_AS_NODE`，否则 Electron 会退化成 Node 跑，报 `whenReady undefined`。
 > `start-claude-buddy.command` 里已经处理。
+
+### 没装 Claude Code？让应用自己装
+
+启动时找不到 `claude`，会弹一个三选一的对话框：
+
+| 选项 | 行为 |
+|---|---|
+| **自动安装** | 打开安装向导，跑官方 `curl` 脚本，实时显示进度；装完自动重新探测并接管 |
+| **手动安装说明** | 跳到官方文档 |
+| **稍后** | 关掉对话框，之后可从菜单「帮助 → 安装 Claude Code…」重新打开 |
+
+安装向导里有两个方法可随时切换 —— 官方脚本（不需要 Node）和 `npm install -g`（适合已经把 Node 管起来的人，装完落在 npm 全局 bin）。命令执行完会**重新扫描磁盘**，只有真的找到可执行文件才报成功；否则如实说明是「退出码 0 但没产出文件」还是「退出码非 0」，并允许换个方法重试。整个过程不写任何配置文件、不改 shell profile。
+
+失败排查看向导里的日志区：`sys:` 是执行的命令，`out:` 是标准输出，`err:` 是标准错误（红色）。常见原因是没有 npm、或全局 bin 目录没权限 —— 这时切到官方脚本一般能绕过。
 
 ### 换成非官方模型端点
 
@@ -246,6 +262,14 @@ GUI 应用的 `PATH` 通常只有 `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 装
 
 见过两类偶发问题，都不是配置错误：回复"本会话没有该工具"（MCP 冷启动超时，工具没挂上）、回复内容完全无关（模型侧偶发跑偏）。程序只能对权限类文字打黄色警告，**内容跑题没法自动判断**，只能偶尔翻「查看记录」。
 
+**9. `CLAUDE_BIN` 指错了会把自己的自动安装坑死**
+
+原逻辑「设了 `CLAUDE_BIN` 就无条件用它」有个死循环：用户填了一个不存在的路径 → 应用提示找不到 → 引导自动安装 → 装成功了，但下一轮仍然用那个错路径 → 还是找不到。改成先验证存在才采纳，失效就退回自动探测。
+
+**10. 安装命令退出码 0 不等于装好了**
+
+`curl | bash` 可能因为权限、网络或镜像问题中途放弃却返回 0。所以判定成功不靠退出码，而是**重新扫一遍磁盘**，真找到可执行文件才算成功；没找到就按退出码区分两种原因分别提示。
+
 ---
 
 ## 已知限制
@@ -282,7 +306,8 @@ claude-buddy/
 ├── renderer/
 │   ├── index.html              三栏布局 + 任务弹窗
 │   ├── style.css               深色主题
-│   └── app.js                  markdown 渲染 / 流式打字 / 工具卡片 / 会话与任务管理
+│   ├── app.js                  markdown 渲染 / 流式打字 / 工具卡片 / 会话与任务管理
+│   └── installer.html          Claude Code 安装向导
 ├── start-claude-buddy.command  双击启动（已处理环境变量）
 ├── assets/                     截图
 └── package.json

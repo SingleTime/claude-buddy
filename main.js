@@ -21,19 +21,44 @@ const crypto = require("node:crypto");
  * （通常只有 /usr/bin:/bin:/usr/sbin:/sbin），homebrew 装的 claude 会找不到。
  * 所以先探常见安装位置，再退回 PATH，最后交给 spawn 自己解析。
  */
-function resolveClaudeBin() {
-  if (process.env.CLAUDE_BIN) return process.env.CLAUDE_BIN;
-
+function claudeCandidates() {
   const home = os.homedir();
-  const candidates = [
+  const list = [
     "/opt/homebrew/bin/claude", // Apple Silicon + Homebrew
     "/usr/local/bin/claude", // Intel + Homebrew
     path.join(home, ".claude/local/claude"), // claude 自带本地安装
-    path.join(home, ".local/bin/claude"), // pipx / 手工安装
+    path.join(home, ".local/bin/claude"), // 官方安装脚本的默认位置
     path.join(home, ".bun/bin/claude"),
     path.join(home, ".npm-global/bin/claude"),
+    path.join(home, ".volta/bin/claude"),
   ];
-  for (const p of candidates) {
+  // nvm / fnm 装的 node，全局 bin 在版本目录里，静态列表够不着
+  for (const root of [".nvm/versions/node", ".fnm/node-versions"]) {
+    try {
+      for (const v of fs.readdirSync(path.join(home, root))) {
+        list.push(path.join(home, root, v, "bin", "claude"));
+        list.push(path.join(home, root, v, "installation", "bin", "claude")); // fnm 的目录结构
+      }
+    } catch {
+      /* 没装这个版本管理器 */
+    }
+  }
+  return list;
+}
+
+function resolveClaudeBin() {
+  // 显式指定优先，但路径失效时要退回去自动探测：
+  // 否则「CLAUDE_BIN 指错了 → 装完新的也永远用旧的」这种死局解不开
+  const explicit = process.env.CLAUDE_BIN;
+  if (explicit) {
+    try {
+      if (fs.existsSync(explicit)) return explicit;
+    } catch {
+      /* 无效路径，继续探测 */
+    }
+  }
+
+  for (const p of claudeCandidates()) {
     try {
       if (fs.existsSync(p)) return p;
     } catch {
@@ -52,7 +77,22 @@ function resolveClaudeBin() {
   return "claude";
 }
 
-const CLAUDE_BIN = resolveClaudeBin();
+let CLAUDE_BIN = resolveClaudeBin();
+
+/** 是否真的定位到了可执行文件（裸名 "claude" 视为未找到） */
+function claudeReady() {
+  try {
+    return CLAUDE_BIN.includes(path.sep) && fs.existsSync(CLAUDE_BIN);
+  } catch {
+    return false;
+  }
+}
+
+/** 安装完成后重新扫描，返回找到的路径或 null */
+function rescanClaudeBin() {
+  CLAUDE_BIN = resolveClaudeBin();
+  return claudeReady() ? CLAUDE_BIN : null;
+}
 
 /** 给子进程补齐 PATH，保证 claude 内部调用 node / git / 其它 CLI 也能命中 */
 function childEnv() {
@@ -909,37 +949,188 @@ function buildMenu() {
         { role: "close", label: "关闭窗口" },
       ],
     },
+    {
+      label: "帮助",
+      submenu: [
+        { label: "安装 Claude Code…", click: () => openInstaller() },
+        {
+          label: "重新检测 claude",
+          click: () => {
+            const bin = rescanClaudeBin();
+            dialog.showMessageBox(mainWindow, {
+              type: bin ? "info" : "warning",
+              message: bin ? "已找到 claude" : "仍然没找到 claude",
+              detail: bin || `已尝试：${CLAUDE_BIN}\n可从「帮助 → 安装 Claude Code…」自动安装。`,
+              buttons: ["好"],
+            });
+          },
+        },
+        { type: "separator" },
+        {
+          label: "项目主页",
+          click: () => shell.openExternal("https://github.com/SingleTime/claude-buddy"),
+        },
+      ],
+    },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-/** 启动自检：claude 不存在时给出明确指引，避免每条消息都静默失败 */
-function warnIfClaudeMissing() {
-  let ok = false;
-  try {
-    ok = CLAUDE_BIN.includes(path.sep)
-      ? fs.existsSync(CLAUDE_BIN)
-      : (process.env.PATH || "")
-          .split(path.delimiter)
-          .some((d) => d && fs.existsSync(path.join(d, "claude")));
-  } catch {
-    ok = false;
-  }
-  if (ok) return;
+/* ------------------------------------------------------------------ */
+/* Claude Code 安装向导                                                */
+/* ------------------------------------------------------------------ */
 
-  dialog.showMessageBox({
+/**
+ * 只有这两条命令，不做任何拼接。
+ * 用户输入永远不进 shell —— 这是无人值守场景能接受的最低安全线。
+ */
+const INSTALL_METHODS = {
+  script: { label: "官方安装脚本", cmd: "curl -fsSL https://claude.ai/install.sh | bash" },
+  npm: { label: "npm 全局安装", cmd: "npm install -g @anthropic-ai/claude-code" },
+};
+
+let installWin = null;
+let installProc = null;
+let installMethod = "script";
+
+function installSend(channel, payload) {
+  if (installWin && !installWin.isDestroyed()) installWin.webContents.send(channel, payload);
+}
+
+function openInstaller(method) {
+  if (method) installMethod = method;
+
+  if (installWin && !installWin.isDestroyed()) {
+    installWin.focus();
+    return;
+  }
+
+  installWin = new BrowserWindow({
+    width: 780,
+    height: 580,
+    minWidth: 620,
+    minHeight: 420,
+    resizable: true,
+    title: "安装 Claude Code",
+    backgroundColor: "#0f1115",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  });
+
+  installWin.loadFile(path.join(__dirname, "renderer", "installer.html"));
+  installWin.webContents.on("did-finish-load", () => startInstall());
+
+  installWin.on("closed", () => {
+    installWin = null;
+    // 窗口关了就别让安装进程在后台裸奔
+    if (installProc) {
+      try {
+        installProc.kill();
+      } catch {
+        /* 已经退出 */
+      }
+      installProc = null;
+    }
+  });
+}
+
+function startInstall(method) {
+  if (method) installMethod = method;
+  if (installProc) return;
+
+  const m = INSTALL_METHODS[installMethod] || INSTALL_METHODS.script;
+  installSend("install:state", {
+    phase: "running",
+    method: installMethod,
+    label: m.label,
+    cmd: m.cmd,
+  });
+  installSend("install:log", { stream: "sys", text: `$ ${m.cmd}` });
+
+  let proc;
+  try {
+    proc = spawn("/bin/bash", ["-lc", m.cmd], {
+      env: childEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (e) {
+    installSend("install:state", { phase: "error", message: `无法启动安装进程：${e.message}` });
+    return;
+  }
+  installProc = proc;
+
+  const timer = setTimeout(
+    () => {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        /* 已经退出 */
+      }
+      installSend("install:log", { stream: "err", text: "超过 5 分钟未完成，已终止" });
+    },
+    5 * 60 * 1000,
+  );
+
+  const pipe = (stream) => (chunk) => {
+    for (const line of String(chunk).split("\n")) {
+      if (line.trim()) installSend("install:log", { stream, text: line });
+    }
+  };
+  proc.stdout.setEncoding("utf8");
+  proc.stdout.on("data", pipe("out"));
+  proc.stderr.setEncoding("utf8");
+  proc.stderr.on("data", pipe("err"));
+
+  proc.on("error", (e) => {
+    clearTimeout(timer);
+    installProc = null;
+    installSend("install:state", { phase: "error", message: `安装进程启动失败：${e.message}` });
+  });
+
+  proc.on("close", (code) => {
+    clearTimeout(timer);
+    installProc = null;
+
+    const bin = rescanClaudeBin();
+    if (bin) {
+      installSend("install:log", { stream: "ok", text: `找到 claude：${bin}` });
+      installSend("install:state", { phase: "success", bin });
+    } else {
+      installSend("install:state", {
+        phase: "error",
+        message:
+          code === 0
+            ? "命令已执行完，但仍没找到 claude 可执行文件"
+            : `安装退出码 ${code}`,
+      });
+    }
+  });
+}
+
+/** 启动自检：claude 不存在时给出明确指引，避免每条消息都静默失败 */
+async function warnIfClaudeMissing() {
+  if (claudeReady()) return;
+
+  const { response } = await dialog.showMessageBox(mainWindow, {
     type: "warning",
     title: "找不到 claude",
-    message: "Claude Buddy 需要先安装 Claude Code CLI",
+    message: "Claude Buddy 需要 Claude Code CLI 才能工作",
     detail:
-      `当前尝试的路径：${CLAUDE_BIN}\n\n` +
-      "安装方式（任选其一）：\n" +
+      `已尝试的路径：${CLAUDE_BIN}\n\n` +
+      "可以让它自动安装（需要联网，通常 1 分钟内完成），也可以自己装：\n" +
       "  npm install -g @anthropic-ai/claude-code\n" +
-      "  curl -fsSL https://claude.ai/install.sh | bash\n\n" +
-      "安装后重启本应用。若装在非标准位置，用环境变量指定：\n" +
-      "  CLAUDE_BIN=/your/path/to/claude",
-    buttons: ["知道了"],
+      "  curl -fsSL https://claude.ai/install.sh | bash",
+    buttons: ["自动安装", "手动安装说明", "稍后"],
+    defaultId: 0,
+    cancelId: 2,
   });
+
+  if (response === 0) openInstaller("script");
+  else if (response === 1) shell.openExternal("https://claude.com/claude-code");
 }
 
 function createWindow() {
@@ -1132,6 +1323,21 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("shell:openPath", (_e, p) => shell.openPath(p));
+
+  /* ---------------- 安装向导 ---------------- */
+
+  ipcMain.handle("install:start", (_e, method) => {
+    startInstall(method);
+    return true;
+  });
+
+  ipcMain.handle("install:close", () => {
+    if (installWin && !installWin.isDestroyed()) installWin.close();
+  });
+
+  ipcMain.handle("install:docs", () => shell.openExternal("https://github.com/SingleTime/claude-buddy"));
+
+  ipcMain.handle("install:recheck", () => ({ bin: rescanClaudeBin() }));
 
   createWindow();
   startScheduler();

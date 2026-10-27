@@ -25,4 +25,22 @@ contextBridge.exposeInMainWorld("buddy", {
     ipcRenderer.on("evt", handler);
     return () => ipcRenderer.removeListener("evt", handler);
   },
+
+  // 安装向导窗口用（主窗口也能拿到，但不会用）
+  install: {
+    start: (method) => ipcRenderer.invoke("install:start", method),
+    close: () => ipcRenderer.invoke("install:close"),
+    docs: () => ipcRenderer.invoke("install:docs"),
+    recheck: () => ipcRenderer.invoke("install:recheck"),
+    onLog: (cb) => {
+      const handler = (_e, payload) => cb(payload);
+      ipcRenderer.on("install:log", handler);
+      return () => ipcRenderer.removeListener("install:log", handler);
+    },
+    onState: (cb) => {
+      const handler = (_e, payload) => cb(payload);
+      ipcRenderer.on("install:state", handler);
+      return () => ipcRenderer.removeListener("install:state", handler);
+    },
+  },
 });

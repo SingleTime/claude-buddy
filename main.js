@@ -1,0 +1,1154 @@
+/**
+ * Claude Buddy — Electron 主进程
+ *
+ * 把 `claude` CLI 的 stream-json 双向通道包装成桌面应用：
+ *   - 每个会话一个常驻子进程（首轮新建，后续 --resume 恢复）
+ *   - 逐行解析 NDJSON 事件，转成渲染层友好的增量事件
+ *   - 会话与统计持久化到 userData/sessions.json
+ */
+
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require("electron");
+const path = require("node:path");
+const fs = require("node:fs");
+const os = require("node:os");
+const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
+
+/**
+ * 定位 claude 可执行文件。
+ *
+ * 不能只靠 PATH：从 Finder / Dock 启动的 GUI 应用拿不到 shell 的 PATH
+ * （通常只有 /usr/bin:/bin:/usr/sbin:/sbin），homebrew 装的 claude 会找不到。
+ * 所以先探常见安装位置，再退回 PATH，最后交给 spawn 自己解析。
+ */
+function resolveClaudeBin() {
+  if (process.env.CLAUDE_BIN) return process.env.CLAUDE_BIN;
+
+  const home = os.homedir();
+  const candidates = [
+    "/opt/homebrew/bin/claude", // Apple Silicon + Homebrew
+    "/usr/local/bin/claude", // Intel + Homebrew
+    path.join(home, ".claude/local/claude"), // claude 自带本地安装
+    path.join(home, ".local/bin/claude"), // pipx / 手工安装
+    path.join(home, ".bun/bin/claude"),
+    path.join(home, ".npm-global/bin/claude"),
+  ];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {
+      /* 忽略无权限目录 */
+    }
+  }
+
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue;
+    try {
+      if (fs.statSync(path.join(dir, "claude")).isFile()) return path.join(dir, "claude");
+    } catch {
+      /* 找不到就下一个 */
+    }
+  }
+  return "claude";
+}
+
+const CLAUDE_BIN = resolveClaudeBin();
+
+/** 给子进程补齐 PATH，保证 claude 内部调用 node / git / 其它 CLI 也能命中 */
+function childEnv() {
+  const extra = [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    path.join(os.homedir(), ".local/bin"),
+  ];
+  const current = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const merged = [...current];
+  for (const p of extra) if (!merged.includes(p)) merged.push(p);
+  return { ...process.env, PATH: merged.join(path.delimiter) };
+}
+
+app.setName("Claude Buddy");
+
+const PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions"];
+
+/* ------------------------------------------------------------------ */
+/* 持久化                                                              */
+/* ------------------------------------------------------------------ */
+
+let storePath = null;
+let store = {
+  version: 2,
+  sessions: [],
+  activeId: null,
+  tasks: [],
+  config: {
+    cwd: os.homedir(),
+    model: "", // 空 = 用 settings.json 里的默认
+    permissionMode: "default",
+  },
+};
+
+function loadStore() {
+  storePath = path.join(app.getPath("userData"), "sessions.json");
+  try {
+    if (fs.existsSync(storePath)) {
+      const raw = JSON.parse(fs.readFileSync(storePath, "utf8"));
+      store = { ...store, ...raw };
+      store.config = { ...{ cwd: os.homedir(), model: "", permissionMode: "default" }, ...(raw.config || {}) };
+      if (!Array.isArray(store.tasks)) store.tasks = [];
+      if (!Array.isArray(store.sessions)) store.sessions = [];
+    }
+  } catch (e) {
+    console.error("[store] 读取失败，使用空存储:", e.message);
+  }
+}
+
+let saveTimer = null;
+function saveStore() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(path.dirname(storePath), { recursive: true });
+      fs.writeFileSync(storePath, JSON.stringify(store, null, 2), "utf8");
+    } catch (e) {
+      console.error("[store] 写入失败:", e.message);
+    }
+  }, 300);
+}
+
+const newId = () => crypto.randomUUID();
+
+function getSession(id) {
+  return store.sessions.find((s) => s.id === id) || null;
+}
+
+function createSession(cwd) {
+  const s = {
+    id: newId(),
+    sessionId: null, // claude 侧 session_id
+    title: "新对话",
+    cwd: cwd || store.config.cwd,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    messages: [],
+    totals: { cost: 0, inputTokens: 0, outputTokens: 0, cacheRead: 0 },
+  };
+  store.sessions.unshift(s);
+  store.activeId = s.id;
+  saveStore();
+  return s;
+}
+
+/* ------------------------------------------------------------------ */
+/* claude 子进程管理                                                    */
+/* ------------------------------------------------------------------ */
+
+/** sessionLocalId -> { proc, buf, stderr, pending } */
+const runners = new Map();
+let mainWindow = null;
+
+function emit(payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("evt", payload);
+  }
+}
+
+function killAllRunners() {
+  for (const [, r] of runners) {
+    try {
+      r.proc.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+  }
+  runners.clear();
+}
+
+function killOthers(keepId) {
+  for (const [id, r] of [...runners]) {
+    if (id === keepId) continue;
+    try {
+      r.proc.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+    runners.delete(id);
+  }
+}
+
+function spawnRunner(session, overrides = {}) {
+  const wantedMode = overrides.permissionMode || store.config.permissionMode;
+  const mode = PERMISSION_MODES.includes(wantedMode) ? wantedMode : "default";
+
+  const args = [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+    "--permission-mode",
+    mode,
+  ];
+  // 定时任务每次都开干净上下文：累积 resume 会让 token 成本指数上涨
+  if (session.sessionId && !overrides.noResume) args.push("--resume", session.sessionId);
+  const model = overrides.model !== undefined ? overrides.model : store.config.model;
+  if (model) args.push("--model", model);
+  // 无人值守场景必须显式放行工具，否则 MCP / Bash 调用会被静默拒绝
+  const allowed = (overrides.allowedTools || "").replace(/\s+/g, "").replace(/,+/g, ",").trim();
+  if (allowed && allowed !== ",") args.push("--allowedTools", allowed);
+
+  const cwd = session.cwd && fs.existsSync(session.cwd) ? session.cwd : os.homedir();
+
+  let proc;
+  try {
+    proc = spawn(CLAUDE_BIN, args, {
+      cwd,
+      env: childEnv(),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (e) {
+    emit({ type: "error", sessionId: session.id, message: `无法启动 claude：${e.message}` });
+    return null;
+  }
+
+  const runner = { proc, buf: "", stderr: "", session };
+  runners.set(session.id, runner);
+
+  proc.stdout.setEncoding("utf8");
+  proc.stdout.on("data", (chunk) => {
+    runner.buf += chunk;
+    let idx;
+    while ((idx = runner.buf.indexOf("\n")) >= 0) {
+      const line = runner.buf.slice(0, idx).trim();
+      runner.buf = runner.buf.slice(idx + 1);
+      if (!line) continue;
+      try {
+        handleClaudeEvent(session, JSON.parse(line));
+      } catch {
+        /* 忽略非 JSON 行 */
+      }
+    }
+  });
+
+  proc.stderr.setEncoding("utf8");
+  proc.stderr.on("data", (chunk) => {
+    runner.stderr += chunk;
+    if (runner.stderr.length > 8000) runner.stderr = runner.stderr.slice(-8000);
+  });
+
+  proc.on("exit", (code, signal) => {
+    runners.delete(session.id);
+    if (code !== 0 && code !== null && runner.stderr.trim()) {
+      emit({
+        type: "error",
+        sessionId: session.id,
+        message: runner.stderr.trim().slice(0, 1200),
+      });
+    }
+    // 任务执行途中进程挂掉（没等到 result），在这里兜底记账
+    if (pendingTaskRuns.has(session.id)) {
+      finishTaskRun(session.id, {
+        ok: code === 0,
+        error:
+          runner.stderr.trim().slice(0, 300) || `子进程异常退出（code=${code}, signal=${signal}）`,
+      });
+    }
+    emit({ type: "proc_exit", sessionId: session.id, code, signal });
+  });
+
+  proc.on("error", (e) => {
+    emit({ type: "error", sessionId: session.id, message: `子进程错误：${e.message}` });
+  });
+
+  return runner;
+}
+
+function getRunner(session) {
+  const existing = runners.get(session.id);
+  if (existing && existing.proc && !existing.proc.killed && existing.proc.exitCode === null) {
+    return existing;
+  }
+  killOthers(session.id);
+  return spawnRunner(session);
+}
+
+function killRunner(sessionId) {
+  const r = runners.get(sessionId);
+  if (!r) return false;
+  try {
+    r.proc.kill("SIGTERM");
+  } catch {
+    /* ignore */
+  }
+  runners.delete(sessionId);
+  return true;
+}
+
+/** 建会话但不抢走用户当前的 activeId（定时任务要用） */
+function createSessionSilent(cwd) {
+  const prev = store.activeId;
+  const s = createSession(cwd);
+  store.activeId = prev;
+  return s;
+}
+
+/* ------------------------------------------------------------------ */
+/* 事件解析                                                            */
+/* ------------------------------------------------------------------ */
+
+/** 当前轮次的块缓冲，用于把 stream_event 拼成完整消息 */
+const turnState = new Map(); // sessionLocalId -> { text, thinking, tools, current }
+
+function turnOf(sessionId) {
+  if (!turnState.has(sessionId)) {
+    turnState.set(sessionId, { text: "", thinking: "", tools: [], current: null });
+  }
+  return turnState.get(sessionId);
+}
+
+function handleClaudeEvent(session, e) {
+  const sid = session.id;
+
+  switch (e.type) {
+    case "system": {
+      if (e.subtype === "init") {
+        session.sessionId = e.session_id;
+        session.model = e.model || session.model;
+        saveStore();
+        emit({
+          type: "init",
+          sessionId: sid,
+          claudeSessionId: e.session_id,
+          model: e.model,
+          cwd: e.cwd,
+          tools: e.tools || [],
+        });
+      } else if (e.subtype === "thinking_tokens") {
+        emit({ type: "thinking_tokens", sessionId: sid, tokens: e.estimated_tokens });
+      } else if (e.subtype === "status") {
+        emit({ type: "status", sessionId: sid, text: e.status || e.message || "" });
+      }
+      return;
+    }
+
+    case "stream_event": {
+      handleStreamEvent(sid, e.event);
+      return;
+    }
+
+    case "assistant": {
+      // 完整消息，用于校正增量结果
+      emit({ type: "assistant_message", sessionId: sid, message: e.message });
+      return;
+    }
+
+    case "user": {
+      // Claude Code 把工具结果放在 user 消息里
+      const content = e.message?.content;
+      if (Array.isArray(content)) {
+        const st = turnOf(sid);
+        for (const block of content) {
+          if (block.type === "tool_result") {
+            const normalized = normalizeToolResult(block.content);
+            const rec = st.tools.find((t) => t.id === block.tool_use_id);
+            if (rec) {
+              rec.result = normalized;
+              rec.isError = !!block.is_error;
+            }
+            emit({
+              type: "tool_result",
+              sessionId: sid,
+              toolUseId: block.tool_use_id,
+              content: normalized,
+              isError: !!block.is_error,
+            });
+          }
+        }
+      }
+      return;
+    }
+
+    case "result": {
+      const cost = e.total_cost_usd || 0;
+      const u = e.usage || {};
+      session.totals.cost += cost;
+      session.totals.inputTokens += u.input_tokens || 0;
+      session.totals.outputTokens += u.output_tokens || 0;
+      session.totals.cacheRead += u.cache_read_input_tokens || 0;
+      if (!session.sessionId && e.session_id) session.sessionId = e.session_id;
+      session.updatedAt = Date.now();
+
+      // 组装本轮 assistant 消息并持久化
+      const st = turnOf(sid);
+      if (st.text.trim() || st.tools.length > 0) {
+        session.messages.push({
+          role: "assistant",
+          text: st.text,
+          thinking: st.thinking,
+          tools: st.tools.map((t) => ({
+            name: t.name,
+            input: t.input,
+            result: t.result || "",
+            isError: !!t.isError,
+          })),
+          at: Date.now(),
+        });
+      }
+      const turnMeta = {
+        cost,
+        durationMs: e.duration_api_ms,
+        usage: u,
+      };
+      turnState.delete(sid);
+      saveStore();
+
+      emit({
+        type: "result",
+        sessionId: sid,
+        cost,
+        durationMs: e.duration_api_ms,
+        usage: u,
+        totals: session.totals,
+        isError: !!e.is_error,
+        stopReason: e.stop_reason,
+        turnText: st.text,
+      });
+
+      // 若是定时任务触发的这一轮，回收结果并更新任务状态
+      finishTaskRun(sid, { ok: !e.is_error, text: st.text, cost, error: e.stop_reason });
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+function normalizeToolResult(content) {
+  if (typeof content === "string") return content.slice(0, 6000);
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => (typeof c === "string" ? c : c?.text || JSON.stringify(c)))
+      .join("\n")
+      .slice(0, 6000);
+  }
+  return JSON.stringify(content ?? "").slice(0, 6000);
+}
+
+function handleStreamEvent(sid, ev) {
+  if (!ev || !ev.type) return;
+  const st = turnOf(sid);
+
+  switch (ev.type) {
+    case "message_start": {
+      // 注意：一轮对话会产生多个 message（工具调用前 / 后），
+      // 这里绝不能清空 text/thinking/tools，它们是整轮累积的结果。
+      st.current = null;
+      emit({ type: "turn_start", sessionId: sid });
+      return;
+    }
+
+    case "content_block_start": {
+      const b = ev.content_block || {};
+      if (b.type === "text") {
+        st.current = { kind: "text", text: "" };
+        emit({ type: "block_start", sessionId: sid, kind: "text" });
+      } else if (b.type === "thinking") {
+        st.current = { kind: "thinking", text: "" };
+        emit({ type: "block_start", sessionId: sid, kind: "thinking" });
+      } else if (b.type === "tool_use") {
+        st.current = { kind: "tool", name: b.name, id: b.id, json: "" };
+        emit({
+          type: "tool_start",
+          sessionId: sid,
+          toolUseId: b.id,
+          name: b.name,
+        });
+      } else {
+        st.current = { kind: b.type || "unknown" };
+      }
+      return;
+    }
+
+    case "content_block_delta": {
+      const d = ev.delta || {};
+      if (!st.current) return;
+      if (d.type === "text_delta") {
+        st.current.text += d.text || "";
+        st.text += d.text || "";
+        emit({ type: "text_delta", sessionId: sid, text: d.text || "" });
+      } else if (d.type === "thinking_delta") {
+        st.current.text += d.thinking || "";
+        st.thinking += d.thinking || "";
+        emit({ type: "thinking_delta", sessionId: sid, text: d.thinking || "" });
+      } else if (d.type === "input_json_delta") {
+        st.current.json += d.partial_json || "";
+        emit({ type: "tool_input_delta", sessionId: sid, text: d.partial_json || "" });
+      }
+      return;
+    }
+
+    case "content_block_stop": {
+      if (st.current && st.current.kind === "tool") {
+        let parsed = null;
+        try {
+          parsed = st.current.json ? JSON.parse(st.current.json) : {};
+        } catch {
+          parsed = { _raw: st.current.json };
+        }
+        st.tools.push({ id: st.current.id, name: st.current.name, input: parsed });
+        emit({
+          type: "tool_input",
+          sessionId: sid,
+          toolUseId: st.current.id,
+          name: st.current.name,
+          input: parsed,
+        });
+      }
+      st.current = null;
+      return;
+    }
+
+    case "message_delta": {
+      const u = ev.usage;
+      if (u) emit({ type: "message_usage", sessionId: sid, usage: u });
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 定时任务调度                                                        */
+/* ------------------------------------------------------------------ */
+
+/** claude 侧会话 id -> { taskId, runId, startedAt, timer } */
+const pendingTaskRuns = new Map();
+/** taskId -> true，防重入 */
+const runningTasks = new Set();
+
+const TASK_TIMEOUT_MS = 15 * 60 * 1000; // 单次运行最长 15 分钟
+const MAX_RUNS_KEPT = 20;
+
+function getTask(id) {
+  return store.tasks.find((t) => t.id === id) || null;
+}
+
+function normalizeTask(input, existing) {
+  const t = existing || { id: newId(), createdAt: Date.now(), runs: [] };
+  t.name = String(input.name || "未命名任务").trim().slice(0, 60);
+  t.prompt = String(input.prompt || "").trim();
+  t.enabled = input.enabled !== false;
+  t.cwd = input.cwd || store.config.cwd;
+  t.permissionMode = input.permissionMode || "acceptEdits";
+  t.model = input.model || "";
+  t.allowedTools = String(input.allowedTools || "").trim().slice(0, 600);
+  t.schedule = {
+    type: input.schedule?.type || "daily",
+    time: input.schedule?.time || "09:00",
+    days: Array.isArray(input.schedule?.days) ? input.schedule.days : [1, 3, 5],
+    everyMinutes: Math.max(1, Number(input.schedule?.everyMinutes) || 120),
+  };
+  t.nextRunAt = computeNext(t, Date.now());
+  return t;
+}
+
+/** 按当前时间推算下一次运行时间戳 */
+function computeNext(task, from) {
+  const s = task.schedule || {};
+  const base = new Date(from);
+
+  if (s.type === "interval") {
+    const mins = Math.max(1, Number(s.everyMinutes) || 120);
+    // 抹掉秒再相加：保持严格 N 分钟间隔，又不会因为余数累积漂移
+    return Math.floor(from / 60000) * 60000 + mins * 60000;
+  }
+
+  const [hh, mm] = String(s.time || "09:00")
+    .split(":")
+    .map((x) => parseInt(x, 10) || 0);
+
+  if (s.type === "weekly") {
+    const days = (s.days || []).filter((d) => d >= 0 && d <= 6);
+    const list = days.length ? days : [1];
+    for (let i = 0; i <= 7; i++) {
+      const d = new Date(base);
+      d.setDate(d.getDate() + i);
+      d.setHours(hh, mm, 0, 0);
+      if (list.includes(d.getDay()) && d.getTime() > from) return d.getTime();
+    }
+    return from + 7 * 86400000;
+  }
+
+  // daily（默认）
+  const d = new Date(base);
+  d.setHours(hh, mm, 0, 0);
+  if (d.getTime() <= from) d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
+
+function taskView(t) {
+  return {
+    id: t.id,
+    name: t.name,
+    prompt: t.prompt,
+    enabled: t.enabled,
+    cwd: t.cwd,
+    permissionMode: t.permissionMode,
+    model: t.model,
+    allowedTools: t.allowedTools || "",
+    schedule: t.schedule,
+    nextRunAt: t.nextRunAt,
+    lastRunAt: t.lastRunAt || null,
+    lastStatus: t.lastStatus || null,
+    lastError: t.lastError || null,
+    lastHint: t.lastHint || null,
+    lastCost: t.lastCost || 0,
+    runCount: (t.runs || []).length,
+    running: runningTasks.has(t.id),
+    sessionId: t.sessionId || null,
+    runs: (t.runs || []).slice(0, 5),
+  };
+}
+
+function emitTasks() {
+  saveStore();
+  emit({ type: "tasks", tasks: store.tasks.map(taskView) });
+}
+
+/** 执行一个任务：起新进程、干净上下文、跑完记结果 */
+async function runTask(task, trigger = "manual") {
+  if (!task || runningTasks.has(task.id)) {
+    return { ok: false, error: "该任务正在运行中" };
+  }
+  if (!task.prompt) return { ok: false, error: "任务没有填写提示词" };
+
+  const runId = newId().slice(0, 8);
+  runningTasks.add(task.id);
+  task.lastStatus = "running";
+  task.lastError = null;
+  emitTasks();
+
+  // 每个任务固定一个会话，历史都堆在这里，方便回看
+  let session = task.sessionId ? getSession(task.sessionId) : null;
+  if (!session) {
+    session = createSessionSilent(task.cwd);
+    session.title = "⏱ " + task.name;
+    session.kind = "task";
+    task.sessionId = session.id;
+  }
+
+  const cwdOk = task.cwd && fs.existsSync(task.cwd);
+  session.cwd = cwdOk ? task.cwd : os.homedir();
+
+  const text = task.prompt;
+  session.messages.push({
+    role: "user",
+    text,
+    at: Date.now(),
+    viaTask: { taskId: task.id, runId, trigger },
+  });
+  session.updatedAt = Date.now();
+  saveStore();
+
+  // 强制新进程：不复用旧 runner，也不 resume（保持上下文干净）
+  killRunner(session.id);
+  const runner = spawnRunner(session, {
+    permissionMode: task.permissionMode,
+    model: task.model,
+    allowedTools: task.allowedTools,
+    noResume: true,
+  });
+  if (!runner) {
+    runningTasks.delete(task.id);
+    task.lastStatus = "error";
+    task.lastError = "无法启动 claude 子进程";
+    emitTasks();
+    return { ok: false, error: task.lastError };
+  }
+
+  const rec = { taskId: task.id, runId, startedAt: Date.now(), trigger, timer: null };
+  pendingTaskRuns.set(session.id, rec);
+
+  // 超时兜底
+  rec.timer = setTimeout(() => {
+    const pend = pendingTaskRuns.get(session.id);
+    if (pend && pend.runId === runId) {
+      killRunner(session.id);
+      finishTaskRun(session.id, {
+        ok: false,
+        error: `运行超时（>${TASK_TIMEOUT_MS / 60000} 分钟）`,
+      });
+    }
+  }, TASK_TIMEOUT_MS);
+
+  try {
+    runner.proc.stdin.write(
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: [{ type: "text", text }] },
+      }) + "\n",
+    );
+  } catch (e) {
+    clearTimeout(rec.timer);
+    pendingTaskRuns.delete(session.id);
+    runningTasks.delete(task.id);
+    task.lastStatus = "error";
+    task.lastError = `写入失败：${e.message}`;
+    emitTasks();
+    return { ok: false, error: task.lastError };
+  }
+
+  emit({ type: "task_started", taskId: task.id, sessionId: session.id, runId, trigger });
+  return { ok: true, sessionId: session.id, runId };
+}
+
+/** result / 超时 / 进程退出时统一收口 */
+function finishTaskRun(sessionId, outcome) {
+  const pend = pendingTaskRuns.get(sessionId);
+  if (!pend) return;
+  pendingTaskRuns.delete(sessionId);
+  if (pend.timer) clearTimeout(pend.timer);
+
+  const task = getTask(pend.taskId);
+  runningTasks.delete(pend.taskId);
+
+  const session = getSession(sessionId);
+  const excerpt = (outcome.text || "").trim().slice(0, 200);
+
+  if (task) {
+    // 记"触发时刻"而不是"完成时刻"：否则运行耗时会被算进间隔里，看起来像延迟
+    task.lastRunAt = pend.startedAt;
+    task.lastStatus = outcome.ok ? "ok" : "error";
+    task.lastError = outcome.ok ? null : String(outcome.error || "未知错误").slice(0, 300);
+    // 模型在被拦、或工具没连上时，仍会正常返回一段文字，退出码是 0，只能从内容识别
+    if (outcome.ok) {
+      const perm = /未获授权|权限提示|权限尚未|待批准|需要批准|permission denied|not granted/i;
+      const missing = /工具不存在|没有.{0,8}这个工具|未配置|未接入|没有连接|没有.{0,4}可用.{0,4}工具/i;
+      task.lastHint = perm.test(excerpt)
+        ? "响应里提到了权限/批准，工具被拦截了。补全工具白名单后重试。"
+        : missing.test(excerpt)
+          ? "模型说找不到工具，多半是 MCP 冷启动超时。重跑一次，仍失败就检查 MCP 是否 Connected。"
+          : null;
+    } else {
+      task.lastHint = null;
+    }
+    task.lastCost = outcome.cost || 0;
+    task.runs = task.runs || [];
+    task.runs.unshift({
+      at: pend.startedAt,
+      finishedAt: Date.now(),
+      runId: pend.runId,
+      trigger: pend.trigger,
+      status: task.lastStatus,
+      cost: task.lastCost,
+      error: task.lastError,
+      excerpt,
+      elapsedMs: Date.now() - pend.startedAt,
+    });
+    task.runs = task.runs.slice(0, MAX_RUNS_KEPT);
+    task.nextRunAt = computeNext(task, Date.now());
+  }
+
+  emit({
+    type: "task_done",
+    taskId: pend.taskId,
+    sessionId,
+    runId: pend.runId,
+    ok: !!outcome.ok,
+    error: task ? task.lastError : null,
+    excerpt,
+    cost: outcome.cost || 0,
+  });
+  emitTasks();
+}
+
+/** 每分钟检查一次，到点就跑 */
+let tickTimer = null;
+function startScheduler() {
+  const tick = () => {
+    const now = Date.now();
+    let dirty = false;
+
+    for (const t of store.tasks) {
+      if (!t.enabled) continue;
+      if (!t.nextRunAt) {
+        t.nextRunAt = computeNext(t, now);
+        dirty = true;
+        continue;
+      }
+      if (now < t.nextRunAt) continue;
+      if (runningTasks.has(t.id)) {
+        // 上次还在跑，顺延到下一周期，避免堆叠
+        t.nextRunAt = computeNext(t, now);
+        dirty = true;
+        continue;
+      }
+
+      // 错过太久（比如合盖一整天）只在 6 小时内补跑，防止一开机连跑十几个
+      const lateBy = now - t.nextRunAt;
+      const shouldRun = lateBy <= 6 * 3600 * 1000;
+
+      const scheduledFor = t.nextRunAt;
+      t.nextRunAt = computeNext(t, now);
+      dirty = true;
+
+      if (shouldRun) {
+        runTask(t, "schedule").catch((e) => {
+          console.error("[task] 执行失败:", e.message);
+          runningTasks.delete(t.id);
+          emitTasks();
+        });
+      } else {
+        t.runs = t.runs || [];
+        t.runs.unshift({
+          at: now,
+          runId: "-",
+          trigger: "skip",
+          status: "skipped",
+          error: `错过超过 6 小时（原定 ${new Date(scheduledFor).toLocaleString("zh-CN")}），已跳过`,
+          cost: 0,
+        });
+        t.runs = t.runs.slice(0, MAX_RUNS_KEPT);
+      }
+    }
+
+    if (dirty) emitTasks();
+  };
+
+  tick();
+  clearInterval(tickTimer);
+  // 10 秒一次：每日任务无所谓，但分钟级间隔任务需要这个精度
+  tickTimer = setInterval(tick, 10000);
+}
+
+/* ------------------------------------------------------------------ */
+/* 发送消息                                                            */
+/* ------------------------------------------------------------------ */
+
+async function sendMessage(session, text) {
+  // 首条消息拿来当标题
+  if (session.title === "新对话" && text.trim()) {
+    session.title = text.trim().slice(0, 30);
+  }
+
+  session.messages.push({ role: "user", text, at: Date.now() });
+  session.updatedAt = Date.now();
+  saveStore();
+
+  const runner = getRunner(session);
+  if (!runner) return { ok: false, error: "子进程启动失败" };
+
+  const payload = {
+    type: "user",
+    message: { role: "user", content: [{ type: "text", text }] },
+  };
+  try {
+    runner.proc.stdin.write(JSON.stringify(payload) + "\n");
+  } catch (e) {
+    return { ok: false, error: `写入失败：${e.message}` };
+  }
+  return { ok: true };
+}
+
+/* ------------------------------------------------------------------ */
+/* 窗口与 IPC                                                          */
+/* ------------------------------------------------------------------ */
+
+function buildMenu() {
+  const template = [
+    {
+      role: "appMenu",
+      submenu: [
+        { role: "about", label: "关于 Claude Buddy" },
+        { type: "separator" },
+        { role: "hide", label: "隐藏 Claude Buddy" },
+        { role: "hideOthers", label: "隐藏其他" },
+        { type: "separator" },
+        { role: "quit", label: "退出 Claude Buddy" },
+      ],
+    },
+    {
+      label: "编辑",
+      submenu: [
+        { role: "undo", label: "撤销" },
+        { role: "redo", label: "重做" },
+        { type: "separator" },
+        { role: "cut", label: "剪切" },
+        { role: "copy", label: "复制" },
+        { role: "paste", label: "粘贴" },
+        { role: "selectAll", label: "全选" },
+      ],
+    },
+    {
+      label: "视图",
+      submenu: [
+        { role: "reload", label: "重新加载" },
+        { role: "toggleDevTools", label: "开发者工具" },
+        { type: "separator" },
+        { role: "resetZoom", label: "实际大小" },
+        { role: "zoomIn", label: "放大" },
+        { role: "zoomOut", label: "缩小" },
+        { type: "separator" },
+        { role: "togglefullscreen", label: "全屏" },
+      ],
+    },
+    {
+      label: "窗口",
+      submenu: [
+        { role: "minimize", label: "最小化" },
+        { role: "close", label: "关闭窗口" },
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+/** 启动自检：claude 不存在时给出明确指引，避免每条消息都静默失败 */
+function warnIfClaudeMissing() {
+  let ok = false;
+  try {
+    ok = CLAUDE_BIN.includes(path.sep)
+      ? fs.existsSync(CLAUDE_BIN)
+      : (process.env.PATH || "")
+          .split(path.delimiter)
+          .some((d) => d && fs.existsSync(path.join(d, "claude")));
+  } catch {
+    ok = false;
+  }
+  if (ok) return;
+
+  dialog.showMessageBox({
+    type: "warning",
+    title: "找不到 claude",
+    message: "Claude Buddy 需要先安装 Claude Code CLI",
+    detail:
+      `当前尝试的路径：${CLAUDE_BIN}\n\n` +
+      "安装方式（任选其一）：\n" +
+      "  npm install -g @anthropic-ai/claude-code\n" +
+      "  curl -fsSL https://claude.ai/install.sh | bash\n\n" +
+      "安装后重启本应用。若装在非标准位置，用环境变量指定：\n" +
+      "  CLAUDE_BIN=/your/path/to/claude",
+    buttons: ["知道了"],
+  });
+}
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1280,
+    height: 860,
+    minWidth: 900,
+    minHeight: 620,
+    titleBarStyle: "hiddenInset",
+    backgroundColor: "#0f1115",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  });
+
+  mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/.test(url)) shell.openExternal(url);
+    return { action: "deny" };
+  });
+}
+
+app.whenReady().then(() => {
+  loadStore();
+  buildMenu();
+
+  ipcMain.handle("app:init", () => ({
+    sessions: store.sessions.map((s) => ({
+      id: s.id,
+      title: s.title,
+      cwd: s.cwd,
+      updatedAt: s.updatedAt,
+      totals: s.totals,
+    })),
+    activeId: store.activeId,
+    config: store.config,
+    tasks: store.tasks.map(taskView),
+    permissionModes: PERMISSION_MODES,
+    platform: process.platform,
+    claudeBin: CLAUDE_BIN,
+  }));
+
+  /* ---------------- 定时任务 ---------------- */
+
+  ipcMain.handle("task:list", () => store.tasks.map(taskView));
+
+  ipcMain.handle("task:save", (_e, input) => {
+    if (!input || !String(input.prompt || "").trim()) {
+      return { ok: false, error: "提示词不能为空" };
+    }
+    const existing = input.id ? getTask(input.id) : null;
+    const t = normalizeTask(input, existing);
+    if (!existing) store.tasks.push(t);
+    saveStore();
+    emitTasks();
+    return { ok: true, task: taskView(t) };
+  });
+
+  ipcMain.handle("task:delete", (_e, id) => {
+    const t = getTask(id);
+    if (t && t.sessionId) {
+      const r = runners.get(t.sessionId);
+      if (r) {
+        try {
+          r.proc.kill("SIGTERM");
+        } catch {
+          /* ignore */
+        }
+        runners.delete(t.sessionId);
+      }
+      pendingTaskRuns.delete(t.sessionId);
+    }
+    store.tasks = store.tasks.filter((x) => x.id !== id);
+    runningTasks.delete(id);
+    saveStore();
+    emitTasks();
+    return true;
+  });
+
+  ipcMain.handle("task:toggle", (_e, { id, enabled }) => {
+    const t = getTask(id);
+    if (!t) return { ok: false };
+    t.enabled = !!enabled;
+    if (t.enabled) t.nextRunAt = computeNext(t, Date.now());
+    saveStore();
+    emitTasks();
+    return { ok: true, task: taskView(t) };
+  });
+
+  ipcMain.handle("task:run", async (_e, id) => {
+    const t = getTask(id);
+    if (!t) return { ok: false, error: "任务不存在" };
+    return runTask(t, "manual");
+  });
+
+  ipcMain.handle("task:stop", (_e, id) => {
+    const t = getTask(id);
+    if (!t || !t.sessionId) return { ok: false };
+    killRunner(t.sessionId);
+    if (pendingTaskRuns.has(t.sessionId)) {
+      finishTaskRun(t.sessionId, { ok: false, error: "已手动停止" });
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle("session:new", (_e, cwd) => {
+    const s = createSession(cwd);
+    return {
+      id: s.id,
+      title: s.title,
+      cwd: s.cwd,
+      updatedAt: s.updatedAt,
+      totals: s.totals,
+    };
+  });
+
+  ipcMain.handle("session:load", (_e, id) => {
+    const s = getSession(id);
+    if (!s) return null;
+    store.activeId = id;
+    saveStore();
+    return s;
+  });
+
+  ipcMain.handle("session:delete", (_e, id) => {
+    const r = runners.get(id);
+    if (r) {
+      try {
+        r.proc.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+      runners.delete(id);
+    }
+    store.sessions = store.sessions.filter((s) => s.id !== id);
+    if (store.activeId === id) store.activeId = store.sessions[0]?.id || null;
+    saveStore();
+    return true;
+  });
+
+  ipcMain.handle("session:send", async (_e, { id, text }) => {
+    const s = getSession(id);
+    if (!s) return { ok: false, error: "会话不存在" };
+    return sendMessage(s, text);
+  });
+
+  ipcMain.handle("session:stop", (_e, id) => {
+    const r = runners.get(id);
+    if (r) {
+      try {
+        r.proc.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+      runners.delete(id);
+    }
+    return true;
+  });
+
+  ipcMain.handle("config:update", (_e, patch) => {
+    store.config = { ...store.config, ...patch };
+    saveStore();
+    // 配置变了，重启活跃进程以生效
+    const active = getSession(store.activeId);
+    if (active) {
+      const r = runners.get(active.id);
+      if (r) {
+        try {
+          r.proc.kill("SIGTERM");
+        } catch {
+          /* ignore */
+        }
+        runners.delete(active.id);
+      }
+    }
+    return store.config;
+  });
+
+  ipcMain.handle("dialog:pickDir", async () => {
+    const res = await dialog.showOpenDialog(mainWindow, {
+      properties: ["openDirectory", "createDirectory"],
+      defaultPath: store.config.cwd,
+    });
+    if (res.canceled || !res.filePaths[0]) return null;
+    return res.filePaths[0];
+  });
+
+  ipcMain.handle("shell:openPath", (_e, p) => shell.openPath(p));
+
+  createWindow();
+  startScheduler();
+  warnIfClaudeMissing();
+
+  app.on("activate", () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on("window-all-closed", () => {
+  killAllRunners();
+  if (process.platform !== "darwin") app.quit();
+});
+
+app.on("before-quit", () => {
+  clearInterval(tickTimer);
+  for (const pend of pendingTaskRuns.values()) if (pend.timer) clearTimeout(pend.timer);
+  killAllRunners();
+});

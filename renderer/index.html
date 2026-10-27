@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;"
+    />
+    <title>Claude Buddy</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <!-- 左：会话列表 -->
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <div class="tabs">
+            <button class="tab active" id="tabChats" data-tab="chats">会话</button>
+            <button class="tab" id="tabTasks" data-tab="tasks">
+              定时任务<span class="tab-count" id="taskCount" hidden>0</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="sidebar-body" id="paneChats">
+          <button class="btn-new" id="newChat">
+            <span class="plus">+</span> 新对话
+          </button>
+          <div class="session-list" id="sessionList"></div>
+        </div>
+
+        <div class="sidebar-body" id="paneTasks" hidden>
+          <button class="btn-new" id="newTask">
+            <span class="plus">+</span> 新建任务
+          </button>
+          <div class="session-list" id="taskList"></div>
+        </div>
+
+        <div class="sidebar-foot">
+          <button class="cwd-btn" id="cwdBtn" title="点击切换工作目录">
+            <span class="dot"></span>
+            <span id="cwdLabel">~</span>
+          </button>
+        </div>
+      </aside>
+
+      <!-- 中：对话 -->
+      <main class="main">
+        <header class="titlebar">
+          <div class="title" id="chatTitle">新对话</div>
+          <div class="actions">
+            <span class="badge" id="modelBadge">—</span>
+            <button class="btn-ghost" id="togglePanel">状态</button>
+          </div>
+        </header>
+
+        <div class="messages" id="messages">
+          <div class="welcome" id="welcome">
+            <div class="welcome-logo">✳</div>
+            <h1>Claude Buddy</h1>
+            <p>由 Claude Code harness 驱动的本地 AI 助手</p>
+            <div class="chips">
+              <button class="chip" data-prompt="介绍一下你当前能用的工具">你能干什么</button>
+              <button class="chip" data-prompt="用 finance-data 查一下 03690 和 600519 的行情">查港股和A股行情</button>
+              <button class="chip" data-prompt="列出当前目录的文件结构，简要说明这个项目是做什么的">看看当前项目</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="composer">
+          <div class="composer-inner">
+            <textarea
+              id="input"
+              rows="1"
+              placeholder="问点什么，或者让它动手干活…"
+              spellcheck="false"
+              autofocus
+            ></textarea>
+            <div class="composer-bar">
+              <span class="hint" id="hint">Enter 发送 · Shift+Enter 换行</span>
+              <div class="composer-right">
+                <button class="btn-stop" id="stopBtn" hidden>停止</button>
+                <button class="btn-send" id="sendBtn">发送</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <!-- 右：状态面板 -->
+      <aside class="panel" id="panel">
+        <div class="panel-section">
+          <div class="panel-label">模型</div>
+          <select id="modelSelect" class="select">
+            <option value="">默认（settings.json）</option>
+            <option value="qwen3.8-flash">qwen3.8-flash</option>
+            <option value="qwen3.8-max">qwen3.8-max</option>
+            <option value="deepseek-v4.1-flash">deepseek-v4.1-flash</option>
+            <option value="deepseek-v4-pro">deepseek-v4-pro</option>
+          </select>
+        </div>
+
+        <div class="panel-section">
+          <div class="panel-label">权限模式</div>
+          <select id="modeSelect" class="select">
+            <option value="default">default（逐次确认）</option>
+            <option value="plan">plan（只读规划）</option>
+            <option value="acceptEdits">acceptEdits（自动改文件）</option>
+            <option value="bypassPermissions">bypass（全放行）</option>
+          </select>
+        </div>
+
+        <div class="panel-section">
+          <div class="panel-label">本会话</div>
+          <div class="stat-row"><span>轮次成本</span><b id="statCost">$0.0000</b></div>
+          <div class="stat-row"><span>累计成本</span><b id="statTotalCost">$0.0000</b></div>
+          <div class="stat-row"><span>输入 tokens</span><b id="statIn">0</b></div>
+          <div class="stat-row"><span>缓存命中</span><b id="statCache">0</b></div>
+          <div class="stat-row"><span>输出 tokens</span><b id="statOut">0</b></div>
+          <div class="stat-row"><span>耗时</span><b id="statDur">—</b></div>
+        </div>
+
+        <div class="panel-section">
+          <div class="panel-label">可用工具 <span id="toolCount" class="muted">0</span></div>
+          <div class="tool-tags" id="toolTags"></div>
+        </div>
+
+        <div class="panel-section">
+          <div class="panel-label">运行状态</div>
+          <div class="stat-row"><span>进程</span><b id="statProc">未启动</b></div>
+          <div class="stat-row"><span>会话 ID</span><b id="statSid" class="mono">—</b></div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- 定时任务编辑弹窗 -->
+    <div class="modal-mask" id="taskModal" hidden>
+      <div class="modal">
+        <div class="modal-head">
+          <span id="modalTitle">新建定时任务</span>
+          <button class="modal-x" id="modalClose">×</button>
+        </div>
+
+        <div class="modal-body">
+          <label class="field">
+            <span class="field-label">任务名称</span>
+            <input type="text" id="fName" placeholder="例如：每日行情简报" maxlength="60" />
+          </label>
+
+          <label class="field">
+            <span class="field-label">提示词（每次运行都会发给 Claude）</span>
+            <textarea
+              id="fPrompt"
+              rows="5"
+              placeholder="例如：用 finance-data 查询我的持仓所在市场的行情，汇总涨跌，标出异动，输出 5 行以内。"
+            ></textarea>
+          </label>
+
+          <div class="field">
+            <span class="field-label">频率</span>
+            <div class="seg" id="fType">
+              <button class="seg-btn active" data-type="daily">每天</button>
+              <button class="seg-btn" data-type="weekly">每周</button>
+              <button class="seg-btn" data-type="interval">间隔</button>
+            </div>
+          </div>
+
+          <div class="field" id="rowTime">
+            <span class="field-label">时间</span>
+            <input type="time" id="fTime" value="09:05" />
+          </div>
+
+          <div class="field" id="rowDays" hidden>
+            <span class="field-label">星期</span>
+            <div class="days" id="fDays">
+              <button class="day" data-d="1">一</button>
+              <button class="day" data-d="2">二</button>
+              <button class="day" data-d="3">三</button>
+              <button class="day" data-d="4">四</button>
+              <button class="day" data-d="5">五</button>
+              <button class="day" data-d="6">六</button>
+              <button class="day" data-d="0">日</button>
+            </div>
+          </div>
+
+          <div class="field" id="rowInterval" hidden>
+            <span class="field-label">每隔（分钟）</span>
+            <input type="number" id="fEvery" value="120" min="1" max="10080" />
+          </div>
+
+          <div class="field-row">
+            <label class="field">
+              <span class="field-label">权限模式</span>
+              <select id="fMode" class="select">
+                <option value="acceptEdits">acceptEdits（自动改文件）</option>
+                <option value="plan">plan（只读规划）</option>
+                <option value="default">default（逐次确认）</option>
+                <option value="bypassPermissions">bypass（全放行）</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">模型</span>
+              <select id="fModel" class="select">
+                <option value="">默认（settings.json）</option>
+                <option value="qwen3.8-flash">qwen3.8-flash</option>
+                <option value="qwen3.8-max">qwen3.8-max</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="field">
+            <span class="field-label">工具白名单（无人值守时放行，逗号分隔）</span>
+            <div class="input-with-btn">
+              <input type="text" id="fAllowed" placeholder="mcp__finance-data__quote, Read, Grep" />
+              <button class="btn-ghost" id="fAllowedFill">填只读</button>
+            </div>
+          </div>
+
+          <label class="field">
+            <span class="field-label">工作目录</span>
+            <div class="input-with-btn">
+              <input type="text" id="fCwd" readonly />
+              <button class="btn-ghost" id="fPickDir">选择</button>
+            </div>
+          </label>
+
+          <p class="modal-note" id="modalNote">
+            仅在本应用运行时触发，错过 &gt;6 小时不补跑。<b>白名单不填则工具全被拒</b>（无人值守时没人点「允许」）。
+          </p>
+        </div>
+
+        <div class="modal-foot">
+          <button class="btn-ghost" id="modalCancel">取消</button>
+          <button class="btn-send" id="modalSave">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

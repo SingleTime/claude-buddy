@@ -1,0 +1,21 @@
+# 依赖
+node_modules/
+
+# 构建产物（体积大，用 Release 分发）
+dist/
+out/
+build/
+
+# 运行时会话数据（含个人对话内容，绝不入库）
+sessions.json
+*.log
+
+# 本地环境
+.env
+.env.local
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

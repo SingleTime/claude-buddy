@@ -53,6 +53,10 @@ claude -p --input-format stream-json --output-format stream-json \
 - **流式输出** — 逐字打字机，含 thinking 增量
 - **思考过程** — 折叠块，可展开
 - **工具调用卡片** — 工具名 / 参数 JSON / 执行结果 / 成功失败状态，可折叠
+- **附件** — 拖进来、点回形针、或直接 `⌘V` 粘截图；图片按 content block 内联给模型看，其他文件落进会话目录并交给 `Read`
+- **产物面板** — 右栏「产物」列出这轮写过哪些文件，图片 / 文本内联预览，其余一键交给系统程序
+- **消息队列** — 生成中继续发的内容不丢弃也不打断，排进队列，这一轮结束自动接着发
+- **会话搜索** — 侧栏按标题和正文检索历史，命中片段点一下跳过去
 - **Markdown 渲染** — 标题、列表、代码块、表格、引用、链接
 - **模型切换** — 右栏下拉，改完自动重启进程生效
 - **权限模式** — `default` / `plan` / `acceptEdits` / `bypassPermissions`
@@ -169,6 +173,20 @@ rm -rf ~/Library/Application\ Support/Claude\ Buddy/runtime          # 打包版
 ![安装向导](assets/screenshot-installer.png)
 
 失败排查看向导里的日志区：`sys:` 是执行的命令与阶段，`out:` 是标准输出，`err:` 是标准错误（红色）。npm 把下载进度（`npm http …`）写在 stderr 上，这个是正常进度、不标红。常见的失败是私有目录不可写（`EACCES`，比如把 `CLAUDE_BUDDY_RUNTIME` 指到了只读位置）—— 换回默认目录或切到官方脚本即可。
+
+### 附件、产物与队列
+
+**附件**（拖入 / 回形针 / `⌘V` 粘图）：
+
+- 图片按 Anthropic 的 image content block **内联进 stream-json**，模型是真的看见图，不是先 OCR 成文字。实测 `qwen3.8-flash` 接得住（`input_tokens` 会把图像 token 算进去）。
+- 其他文件（PDF / Office / 代码……）拷进 `~/Library/Application Support/Claude Buddy/attachments/<会话 id>/`，消息里附绝对路径让模型自己 `Read`。这些路径在 cwd 之外，所以启动参数带 `--add-dir <附件目录>`，否则 `Read` 会被权限拦下来 —— 这个坑实测踩过。
+- 附件不会写进你的工作目录，删会话时一起删掉。
+
+**产物面板**：只认 `Write` / `Edit` / `MultiEdit` / `NotebookEdit` 这类工具的 `file_path`。点击内联预览（图片直接显示、文本按原样渲染，单文件上限 800KB），预览读盘限制在工作目录与附件目录内，避免模型给的路径把 `~/.ssh` 读进界面。
+
+**消息队列**：正在生成时再发一条不会丢，按顺序排进输入框上方的队列，这一轮 `result` 到了自动接着发。排队中的条目可以点 `×` 撤掉。
+
+> 工具入参偶尔会因为非官方端点截断而拿不到完整 JSON（`_raw`），解析退化成用正则捞 `file_path` 之类的字段 —— 所以产物面板在这种情况下仍然能工作。
 
 ### 换成非官方模型端点
 
@@ -333,6 +351,14 @@ npm 的 postinstall 只把二进制硬链接到 **npm 自己的 prefix**，不�
 
 `npm install --ignore-scripts`（或 `--omit=optional`）时，`@anthropic-ai/claude-code` 的 `bin/claude.exe` 不是原生二进制，而是一个 **500 字节、可执行、会打印错误并 `exit 1`** 的 shell 提示。只判断"文件存在 + 有 x 位"会把它当成 claude 启动，症状是每轮对话都莫名其妙退出。判据换成体积：真实二进制 260MB 以上，小于 1MB 一律当没装。
 
+**14. 附件放在 cwd 之外，`Read` 直接被拒**
+
+附件落在 `userData/attachments/` 下，不在工作目录里。第一版只把路径写进消息，模型老老实实调 `Read`，然后拿到一句「Claude requested permissions to read from ... but you haven't granted it yet」—— headless 通道里没人能点「允许」，这轮就废了。修法：起进程时带 `--add-dir <该会话的附件目录>`，把附件目录显式加进可访问范围。
+
+**15. 换模型时旧进程的退出会把新一轮状态踩掉**
+
+`config:update` 会杀掉旧 runner 重起。旧进程的 `exit` 事件是异步的，如果这时候用户已经发了下一条，`proc_exit` 处理器会把新一轮的 `busy` 重置成 false、还会 `runners.delete(session.id)` 把**新**进程从表里删掉 —— 之后写进 stdin 的消息全部落空，界面留一个空气泡。修法：退出时先比对 `runners.get(id).proc === proc`，不是自己就不动表；事件里带上 `current` 标志，渲染层忽略旧进程的 `proc_exit`。
+
 ---
 
 ## 已知限制
@@ -342,10 +368,11 @@ npm 的 postinstall 只把二进制硬链接到 **npm 自己的 prefix**，不�
 | 平台 | 仅 macOS。Windows / Linux 未适配（Electron 本身跨平台，但路径与进程管理要改） |
 | 代码签名 | 未签名。自行打包后首次打开需右键 → 打开，或 `xattr -dr com.apple.quarantine` |
 | 权限确认 | `default` 模式下需要确认的工具在 headless 通道里会被直接拒绝，不会弹窗问你。想让它自己干活用 `acceptEdits` |
-| 会话搜索 | 未做 |
 | 定时任务依赖主进程 | ⌘Q 退出后不再触发；"错过超过 6 小时"的任务不补跑 |
 | 任务并发 | 多个任务同时到点会各自起一个 claude 进程，没有全局并发上限 |
 | 任务通知 | 只落进应用内，没有系统通知 |
+| 产物识别 | 只认 `Write` / `Edit` 这类工具的 `file_path`；`Bash` 里重定向出来的文件不会进列表 |
+| 队列不持久化 | 排队中的消息只在内存里，切会话或退出就没了 |
 | 私有运行时只在应用内可见 | 应用自己装的那份不会进 PATH，终端里敲 `claude` 不会有。要在终端用就自己 `npm i -g` 一份，应用会优先用自己那份 |
 
 ---
@@ -354,7 +381,6 @@ npm 的 postinstall 只把二进制硬链接到 **npm 自己的 prefix**，不�
 
 - [ ] 系统通知（定时任务完成 / 失败）
 - [ ] 全局任务并发上限
-- [ ] 会话全文搜索
 - [ ] 用 `launchd` 托管，脱离主进程跑定时任务
 - [ ] 打包脚本 + Release 产物
 - [ ] Windows / Linux 适配

@@ -412,6 +412,16 @@ function spawnRunner(session, overrides = {}) {
   const allowed = (overrides.allowedTools || "").replace(/\s+/g, "").replace(/,+/g, ",").trim();
   if (allowed && allowed !== ",") args.push("--allowedTools", allowed);
 
+  // 附件存在 userData 下，不在 cwd 里，Read 会被权限拦下来。
+  // 显式把附件目录加进可访问目录，模型才读得到；放最后是因为它吃多个值。
+  const attDir = attachmentsDir(session.id);
+  try {
+    fs.mkdirSync(attDir, { recursive: true });
+    args.push("--add-dir", attDir);
+  } catch {
+    /* 建不出来就只走图片内联 */
+  }
+
   const cwd = session.cwd && fs.existsSync(session.cwd) ? session.cwd : os.homedir();
 
   let proc;
@@ -452,7 +462,11 @@ function spawnRunner(session, overrides = {}) {
   });
 
   proc.on("exit", (code, signal) => {
-    runners.delete(session.id);
+    // 只清理自己这条：改了模型/权限后会起新进程，旧进程退出时不能把新的从表里删掉，
+    // 否则后续写入全部落空，界面还会把新一轮的 busy 状态重置掉
+    const cur = runners.get(session.id);
+    const isCurrent = !!cur && cur.proc === proc;
+    if (isCurrent) runners.delete(session.id);
     if (code !== 0 && code !== null && runner.stderr.trim()) {
       emit({
         type: "error",
@@ -468,7 +482,7 @@ function spawnRunner(session, overrides = {}) {
           runner.stderr.trim().slice(0, 300) || `子进程异常退出（code=${code}, signal=${signal}）`,
       });
     }
-    emit({ type: "proc_exit", sessionId: session.id, code, signal });
+    emit({ type: "proc_exit", sessionId: session.id, code, signal, current: isCurrent });
   });
 
   proc.on("error", (e) => {
@@ -519,6 +533,34 @@ function turnOf(sessionId) {
     turnState.set(sessionId, { text: "", thinking: "", tools: [], current: null });
   }
   return turnState.get(sessionId);
+}
+
+/**
+ * 解析工具入参。
+ *
+ * 正常情况下是完整 JSON。但对接非官方端点时，最后一段 input_json_delta 可能
+ * 没送到（模型侧被截断），JSON.parse 直接挂掉 —— 整张工具卡片就只剩一个
+ * `_raw` 字符串，产物路径也提取不到。这里退一步，用正则从半截 JSON 里捞
+ * 常用字段，至少让界面和产物面板还能用。
+ */
+function parseToolInput(raw) {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    /* 半截 JSON，往下捞字段 */
+  }
+  const out = { _raw: raw, _partial: true };
+  for (const key of ["file_path", "notebook_path", "path", "command", "pattern", "url"]) {
+    const m = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(raw);
+    if (!m) continue;
+    try {
+      out[key] = JSON.parse(`"${m[1]}"`);
+    } catch {
+      out[key] = m[1];
+    }
+  }
+  return out;
 }
 
 function handleClaudeEvent(session, e) {
@@ -705,12 +747,7 @@ function handleStreamEvent(sid, ev) {
 
     case "content_block_stop": {
       if (st.current && st.current.kind === "tool") {
-        let parsed = null;
-        try {
-          parsed = st.current.json ? JSON.parse(st.current.json) : {};
-        } catch {
-          parsed = { _raw: st.current.json };
-        }
+        const parsed = parseToolInput(st.current.json);
         st.tools.push({ id: st.current.id, name: st.current.name, input: parsed });
         emit({
           type: "tool_input",
@@ -1040,26 +1077,188 @@ function startScheduler() {
 }
 
 /* ------------------------------------------------------------------ */
+/* 附件                                                                */
+/* ------------------------------------------------------------------ */
+
+const IMAGE_TYPES = new Map([
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".gif", "image/gif"],
+  [".webp", "image/webp"],
+  [".bmp", "image/bmp"],
+]);
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 单图上限
+const MAX_ATTACH_BYTES = 64 * 1024 * 1024; // 单个附件上限
+const MAX_PREVIEW_BYTES = 800 * 1024; // 文本预览上限
+
+/** 附件落在 userData 下，不往用户的工作目录里扔东西 */
+function attachmentsDir(sessionId) {
+  return path.join(app.getPath("userData"), "attachments", String(sessionId));
+}
+
+function attachMeta(filePath) {
+  const st = fs.statSync(filePath);
+  const ext = path.extname(filePath).toLowerCase();
+  return {
+    id: crypto.randomUUID(),
+    name: path.basename(filePath),
+    path: filePath,
+    size: st.size,
+    mediaType: IMAGE_TYPES.get(ext) || "",
+    isImage: IMAGE_TYPES.has(ext) && st.size <= MAX_IMAGE_BYTES,
+  };
+}
+
+/** 把外部文件拷进会话附件目录，返回元数据（失败的带 error） */
+function importAttachments(sessionId, paths) {
+  const dir = attachmentsDir(sessionId);
+  const out = [];
+  for (const src of Array.isArray(paths) ? paths : []) {
+    try {
+      const st = fs.statSync(src);
+      if (!st.isFile()) {
+        out.push({ error: `${path.basename(src)} 不是文件` });
+        continue;
+      }
+      if (st.size > MAX_ATTACH_BYTES) {
+        out.push({ error: `${path.basename(src)} 超过 64MB` });
+        continue;
+      }
+      fs.mkdirSync(dir, { recursive: true });
+      let dest = path.join(dir, path.basename(src));
+      // 同名不覆盖：加时间戳前缀，避免把自己刚拷进去的文件当成源
+      if (fs.existsSync(dest)) dest = path.join(dir, `${Date.now()}-${path.basename(src)}`);
+      fs.copyFileSync(src, dest);
+      out.push(attachMeta(dest));
+    } catch (e) {
+      out.push({ error: `${path.basename(src)}: ${e.message}` });
+    }
+  }
+  return out;
+}
+
+/** 粘贴进来的图片是 data URL，直接落盘 */
+function saveDataUrl(sessionId, name, dataUrl) {
+  const m = /^data:([^;]+);base64,([\s\S]+)$/.exec(String(dataUrl || ""));
+  if (!m) return { error: "不是合法的图片数据" };
+  const mediaType = m[1];
+  const buf = Buffer.from(m[2], "base64");
+  if (buf.length > MAX_IMAGE_BYTES) return { error: "图片超过 4MB" };
+  const ext = [...IMAGE_TYPES].find(([, t]) => t === mediaType)?.[0] || ".png";
+  const dir = attachmentsDir(sessionId);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${Date.now()}-${String(name || "pasted").replace(/[^\w.-]/g, "_")}${ext}`);
+    fs.writeFileSync(file, buf);
+    return attachMeta(file);
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+/** target 是否在 parent 目录内（不含 parent 本身） */
+function isUnder(parent, target) {
+  const rel = path.relative(parent, target);
+  return !!rel && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/**
+ * 只读预览一个文件。
+ *
+ * 路径必须落在工作目录或附件目录里 —— 渲染层的绝对路径来自工具调用，
+ * 而工具调用是模型给的，不能让它顺手把 ~/.ssh 读进界面。
+ */
+function previewFile(filePath, sessionId) {
+  const p = path.resolve(String(filePath || ""));
+  const roots = [store.config.cwd, attachmentsDir(sessionId || "")];
+  for (const s of store.sessions) if (s.cwd) roots.push(s.cwd);
+
+  if (!roots.some((r) => r && (p === r || isUnder(r, p)))) {
+    return { ok: false, error: "只能预览工作目录或附件目录里的文件" };
+  }
+  let st;
+  try {
+    st = fs.statSync(p);
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+  if (!st.isFile()) return { ok: false, error: "不是文件" };
+
+  const mediaType = IMAGE_TYPES.get(path.extname(p).toLowerCase());
+  if (mediaType && st.size <= MAX_IMAGE_BYTES) {
+    try {
+      const b64 = fs.readFileSync(p).toString("base64");
+      return { ok: true, kind: "image", path: p, name: path.basename(p), size: st.size, dataUrl: `data:${mediaType};base64,${b64}` };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+
+  if (st.size > MAX_PREVIEW_BYTES) {
+    return { ok: true, kind: "binary", path: p, name: path.basename(p), size: st.size, error: "文件太大，不内联预览" };
+  }
+  try {
+    const buf = fs.readFileSync(p);
+    // 有 NUL 字节就当二进制，别往界面塞乱码
+    if (buf.includes(0)) {
+      return { ok: true, kind: "binary", path: p, name: path.basename(p), size: st.size };
+    }
+    return { ok: true, kind: "text", path: p, name: path.basename(p), size: st.size, text: buf.toString("utf8") };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* 发送消息                                                            */
 /* ------------------------------------------------------------------ */
 
-async function sendMessage(session, text) {
+async function sendMessage(session, text, attachments) {
+  const atts = (Array.isArray(attachments) ? attachments : []).filter(
+    (a) => a && a.path && fs.existsSync(a.path),
+  );
+  // 只发文件不带字也要能发：拿文件名当占位，不替用户编话
+  const body = text.trim() || atts.map((a) => a.name).join("、");
+
   // 首条消息拿来当标题
-  if (session.title === "新对话" && text.trim()) {
-    session.title = text.trim().slice(0, 30);
+  if (session.title === "新对话" && body.trim()) {
+    session.title = body.trim().slice(0, 30);
   }
 
-  session.messages.push({ role: "user", text, at: Date.now() });
+  session.messages.push({
+    role: "user",
+    text: body,
+    at: Date.now(),
+    attachments: atts.map((a) => ({ name: a.name, path: a.path, isImage: !!a.isImage, size: a.size })),
+  });
   session.updatedAt = Date.now();
   saveStore();
 
   const runner = getRunner(session);
   if (!runner) return { ok: false, error: "子进程启动失败" };
 
-  const payload = {
-    type: "user",
-    message: { role: "user", content: [{ type: "text", text }] },
-  };
+  // 图片走 content block 内联（模型直接看见），其他文件给路径让 Read 自己读
+  const content = [{ type: "text", text: body }];
+  const files = [];
+  for (const a of atts) {
+    if (a.isImage) {
+      try {
+        const b64 = fs.readFileSync(a.path).toString("base64");
+        const mediaType = a.mediaType || IMAGE_TYPES.get(path.extname(a.path).toLowerCase()) || "image/png";
+        content.push({ type: "image", source: { type: "base64", media_type: mediaType, data: b64 } });
+      } catch {
+        files.push(a.path);
+      }
+    } else {
+      files.push(a.path);
+    }
+  }
+  if (files.length) {
+    content[0].text += `\n\n附件（请用 Read 工具读取）：\n${files.map((f) => `- ${f}`).join("\n")}`;
+  }
+
+  const payload = { type: "user", message: { role: "user", content } };
   try {
     runner.proc.stdin.write(JSON.stringify(payload) + "\n");
   } catch (e) {
@@ -1526,13 +1725,90 @@ app.whenReady().then(() => {
     store.sessions = store.sessions.filter((s) => s.id !== id);
     if (store.activeId === id) store.activeId = store.sessions[0]?.id || null;
     saveStore();
+    // 会话删了，附件也别留着占 260MB 的带宽
+    try {
+      fs.rmSync(attachmentsDir(id), { recursive: true, force: true });
+    } catch {
+      /* 没附件目录就算了 */
+    }
     return true;
   });
 
-  ipcMain.handle("session:send", async (_e, { id, text }) => {
+  ipcMain.handle("session:send", async (_e, { id, text, attachments }) => {
     const s = getSession(id);
     if (!s) return { ok: false, error: "会话不存在" };
-    return sendMessage(s, text);
+    const r = await sendMessage(s, text, attachments);
+    // 首条消息会顺手把标题定下来，回传给渲染层，标题栏不用等下次重开
+    return { ...r, title: s.title };
+  });
+
+  /* ---------------- 附件 ---------------- */
+
+  ipcMain.handle("file:pick", async () => {
+    const r = await dialog.showOpenDialog(mainWindow, {
+      title: "选择要发给它的文件",
+      properties: ["openFile", "multiSelections"],
+    });
+    return r.canceled ? [] : r.filePaths;
+  });
+
+  ipcMain.handle("attachment:import", (_e, { sessionId, paths }) => {
+    if (!getSession(sessionId)) return [];
+    return importAttachments(sessionId, paths);
+  });
+
+  ipcMain.handle("attachment:saveDataUrl", (_e, { sessionId, name, dataUrl }) => {
+    if (!getSession(sessionId)) return { error: "会话不存在" };
+    return saveDataUrl(sessionId, name, dataUrl);
+  });
+
+  ipcMain.handle("file:preview", (_e, { path: p, sessionId }) => previewFile(p, sessionId));
+
+  // 暂存阶段读缩略图：路径来自用户自己拖进来/选的文件，还没进会话目录，
+  // 所以不受「工作目录内」限制，但只回图片，不回文本。
+  ipcMain.handle("attachment:thumb", (_e, p) => {
+    try {
+      const st = fs.statSync(p);
+      const mediaType = IMAGE_TYPES.get(path.extname(p).toLowerCase());
+      if (!mediaType || !st.isFile() || st.size > MAX_IMAGE_BYTES) return null;
+      return {
+        dataUrl: `data:${mediaType};base64,${fs.readFileSync(p).toString("base64")}`,
+        size: st.size,
+      };
+    } catch {
+      return null;
+    }
+  });
+
+  /* ---------------- 会话搜索 ---------------- */
+
+  ipcMain.handle("session:search", (_e, q) => {
+    const kw = String(q || "").trim().toLowerCase();
+    if (!kw) return [];
+    const hits = [];
+    for (const s of store.sessions) {
+      const title = String(s.title || "");
+      const titleHit = title.toLowerCase().includes(kw);
+      let snippet = "";
+      let at = s.updatedAt || 0;
+      // 倒序找最近一条命中的消息
+      for (let i = (s.messages || []).length - 1; i >= 0; i--) {
+        const m = s.messages[i];
+        const t = String(m.text || "");
+        const idx = t.toLowerCase().indexOf(kw);
+        if (idx >= 0) {
+          const from = Math.max(0, idx - 30);
+          snippet = (from > 0 ? "…" : "") + t.slice(from, idx + kw.length + 50).replace(/\n/g, " ");
+          at = m.at || at;
+          break;
+        }
+      }
+      if (titleHit || snippet) {
+        hits.push({ id: s.id, title: title || "新对话", snippet, at, cwd: s.cwd });
+      }
+      if (hits.length >= 50) break;
+    }
+    return hits.sort((a, b) => b.at - a.at);
   });
 
   ipcMain.handle("session:stop", (_e, id) => {

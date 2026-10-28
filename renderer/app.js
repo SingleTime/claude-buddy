@@ -37,6 +37,24 @@ const els = {
   taskCount: $("taskCount"),
   newTask: $("newTask"),
   taskModal: $("taskModal"),
+  // 附件 / 队列
+  attachBar: $("attachBar"),
+  attachBtn: $("attachBtn"),
+  queueBar: $("queueBar"),
+  dropMask: $("dropMask"),
+  // 搜索
+  searchInput: $("searchInput"),
+  searchClear: $("searchClear"),
+  // 产物 / 预览
+  artifactList: $("artifactList"),
+  artifactEmpty: $("artifactEmpty"),
+  artifactCount: $("artifactCount"),
+  previewModal: $("previewModal"),
+  previewBody: $("previewBody"),
+  previewTitle: $("previewTitle"),
+  previewMeta: $("previewMeta"),
+  previewOpen: $("previewOpen"),
+  previewClose: $("previewClose"),
 };
 
 const state = {
@@ -50,6 +68,10 @@ const state = {
   tab: "chats",
   editing: null, // 正在编辑的任务（null = 新建）
   draft: null, // 弹窗内的临时值
+  attachments: [], // 待发送附件
+  queue: [], // 忙碌时排队的消息
+  artifacts: new Map(), // 本会话产出的文件 path -> meta
+  searchHits: null, // 非 null 表示正在展示搜索结果
 };
 
 /* ------------------------------------------------------------------ */
@@ -245,7 +267,7 @@ function showWelcome() {
   );
 }
 
-function appendUserMsg(text, viaTask) {
+function appendUserMsg(text, viaTask, attachments) {
   const wrap = el("div", "msg user");
   const tag = viaTask
     ? `<div class="msg-task-tag">⏱ 定时触发${
@@ -255,6 +277,32 @@ function appendUserMsg(text, viaTask) {
   wrap.innerHTML = `
     <div class="msg-avatar">你</div>
     <div class="msg-body">${tag}<div class="md">${mdRender(text)}</div></div>`;
+
+  const body = wrap.querySelector(".msg-body");
+  if (attachments && attachments.length) {
+    const bar = el("div", "msg-atts");
+    for (const a of attachments) {
+      const chip = el("div", "msg-att");
+      const ico = el("div", "attach-ico", isImageName(a.name) ? "🖼" : "📄");
+      chip.appendChild(ico);
+      chip.appendChild(el("span", "", escapeHtml(a.name)));
+      chip.title = a.path || a.name;
+      // 图片从磁盘读出来才能显示（CSP 只放行 data:）
+      if (isImageName(a.name) && a.path) {
+        buddy.previewFile(a.path, state.activeId).then((r) => {
+          if (r && r.ok && r.kind === "image") {
+            const img = new Image();
+            img.src = r.dataUrl;
+            chip.replaceChild(img, ico);
+          }
+        });
+      }
+      chip.addEventListener("click", () => a.path && openPreview(a.path));
+      bar.appendChild(chip);
+    }
+    body.appendChild(bar);
+  }
+
   els.messages.appendChild(wrap);
   els.messages.scrollTop = els.messages.scrollHeight;
 }
@@ -481,6 +529,10 @@ function onEvent(evt) {
           null,
           1,
         );
+        // 写入类工具的 file_path 就是这轮的产物
+        if (WRITE_TOOLS.has(rec.name)) {
+          addArtifact(toolPath(evt.input), rec.name);
+        }
       }
       break;
     }
@@ -537,6 +589,7 @@ function onEvent(evt) {
       endTurn();
       scrollIfNear(wasNear);
       refreshSessionList();
+      flushQueue();
       break;
     }
 
@@ -549,6 +602,8 @@ function onEvent(evt) {
     }
 
     case "proc_exit": {
+      // 旧进程（换模型/换权限时被杀掉的那条）退出，不影响当前这一轮
+      if (evt.current === false) break;
       els.statProc.textContent = "已退出";
       els.statProc.style.color = "var(--text-faint)";
       if (state.busy) {
@@ -556,6 +611,7 @@ function onEvent(evt) {
         updateBusy();
         endTurn();
       }
+      flushQueue();
       break;
     }
 
@@ -597,6 +653,7 @@ async function refreshSessionList() {
 }
 
 function renderSessionList() {
+  if (state.searchHits !== null) return; // 正在看搜索结果，别被后台刷新冲掉
   els.sessionList.innerHTML = "";
   for (const s of state.sessions) {
     const item = el("div", "session-item" + (s.id === state.activeId ? " active" : ""));
@@ -642,11 +699,14 @@ async function openSession(id) {
   updateStats(s.totals || { cost: 0, inputTokens: 0, outputTokens: 0, cacheRead: 0 });
 
   clearMessages();
+  state.queue = [];
+  renderQueue();
+  rebuildArtifacts(s);
   if (!s.messages || s.messages.length === 0) {
     showWelcome();
   } else {
     for (const m of s.messages) {
-      if (m.role === "user") appendUserMsg(m.text, m.viaTask);
+      if (m.role === "user") appendUserMsg(m.text, m.viaTask, m.attachments);
       else appendAssistantFromHistory(m);
     }
     els.messages.scrollTop = els.messages.scrollHeight;
@@ -669,36 +729,445 @@ async function newSession() {
 /* ------------------------------------------------------------------ */
 
 function updateBusy() {
-  els.sendBtn.disabled = state.busy;
+  els.sendBtn.disabled = false; // 忙碌时也点得动 —— 点了就是排队
+  els.sendBtn.textContent = state.busy ? "排队" : "发送";
   els.stopBtn.hidden = !state.busy;
-  els.hint.textContent = state.busy ? "正在生成…" : "Enter 发送 · Shift+Enter 换行";
+  els.hint.textContent = state.busy
+    ? "正在生成… 现在发送会排进队列，等这轮结束自动接着发"
+    : "Enter 发送 · Shift+Enter 换行 · 可拖入文件或粘贴截图";
 }
 
 async function send(text) {
   const t = (text ?? els.input.value).trim();
-  if (!t || state.busy) return;
+  if (!t && state.attachments.length === 0) return;
 
+  // 忙碌时不丢弃也不打断：排进队列，等这一轮 result 再发
+  if (state.busy) {
+    state.queue.push({ text: t, attachments: state.attachments.slice() });
+    state.attachments = [];
+    els.input.value = "";
+    autoGrow();
+    renderAttachBar();
+    renderQueue();
+    return;
+  }
+
+  // 同步占位：连点两次「发送」时，第二次必须走队列而不是并发出两条
+  state.busy = true;
+  updateBusy();
+
+  const atts = state.attachments.slice();
+  state.attachments = [];
+  els.input.value = "";
+  autoGrow();
+  renderAttachBar();
+  await sendNow(t, atts);
+}
+
+async function sendNow(text, atts) {
   if (!state.activeId) {
     await newSession();
   }
+  if (!state.activeId) return;
+
+  // 附件先落盘到会话目录，拿到最终路径再发
+  const staged = await commitAttachments(atts || []);
 
   const welcome = els.messages.querySelector(".welcome");
   if (welcome) welcome.remove();
 
-  appendUserMsg(t);
-  els.input.value = "";
-  autoGrow();
-
+  appendUserMsg(text, null, staged);
   state.busy = true;
   updateBusy();
   ensureTurn();
 
-  const res = await buddy.send(state.activeId, t);
+  const res = await buddy.send(state.activeId, text, staged);
+  if (res && res.title) {
+    els.chatTitle.textContent = res.title;
+    if (state.active) state.active.title = res.title;
+  }
   if (!res || !res.ok) {
     appendError((res && res.error) || "发送失败");
     state.busy = false;
     updateBusy();
     endTurn();
+    flushQueue();
+  }
+}
+
+/** 队列里有东西就接着发一条 */
+function flushQueue() {
+  if (state.busy) return;
+  const next = state.queue.shift();
+  if (!next) return;
+  state.busy = true;
+  updateBusy();
+  renderQueue();
+  sendNow(next.text, next.attachments || []);
+}
+
+async function commitAttachments(atts) {
+  if (!atts.length) return [];
+  const out = [];
+  const paths = atts.filter((a) => a.kind === "file").map((a) => a.path);
+  if (paths.length) {
+    const rs = await buddy.attachFiles(state.activeId, paths);
+    for (const r of rs || []) {
+      if (r && r.error) appendError(`附件：${r.error}`);
+      else if (r) out.push(r);
+    }
+  }
+  for (const a of atts.filter((x) => x.kind === "dataUrl")) {
+    const r = await buddy.attachDataUrl(state.activeId, a.name, a.dataUrl);
+    if (r && r.error) appendError(`附件：${r.error}`);
+    else if (r) out.push(r);
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* 附件：选择 / 拖拽 / 粘贴                                            */
+/* ------------------------------------------------------------------ */
+
+function isImageName(name) {
+  return /\.(png|jpe?g|gif|webp|bmp)$/i.test(String(name || ""));
+}
+
+function fmtSize(n) {
+  const b = Number(n) || 0;
+  if (b < 1024) return b + " B";
+  if (b < 1024 * 1024) return (b / 1024).toFixed(0) + " KB";
+  return (b / 1024 / 1024).toFixed(1) + " MB";
+}
+
+function addAttachments(list) {
+  for (const a of list) {
+    if (!a) continue;
+    // 同一个文件不重复贴
+    if (a.kind === "file" && state.attachments.some((x) => x.path === a.path)) continue;
+    state.attachments.push(a);
+  }
+  renderAttachBar();
+}
+
+function renderAttachBar() {
+  const list = state.attachments;
+  els.attachBar.hidden = list.length === 0;
+  els.attachBar.innerHTML = "";
+  list.forEach((a, i) => {
+    const chip = el("div", "attach-chip");
+    if (a.kind === "dataUrl") {
+      const img = new Image();
+      img.src = a.dataUrl;
+      chip.appendChild(img);
+    } else if (isImageName(a.name) && a.dataUrl) {
+      const img = new Image();
+      img.src = a.dataUrl;
+      chip.appendChild(img);
+    } else {
+      chip.appendChild(el("div", "attach-ico", isImageName(a.name) ? "🖼" : "📄"));
+    }
+    const name = el("span", "attach-name", escapeHtml(a.name));
+    name.title = `${a.name}${a.size ? " · " + fmtSize(a.size) : ""}`;
+    chip.appendChild(name);
+    const x = el("button", "attach-x", "×");
+    x.title = "移除";
+    x.addEventListener("click", () => {
+      state.attachments.splice(i, 1);
+      renderAttachBar();
+    });
+    chip.appendChild(x);
+    els.attachBar.appendChild(chip);
+  });
+}
+
+/** 外部文件 → 暂存项。图片顺手读一份 dataUrl 用来显示缩略图 */
+async function stagePaths(paths) {
+  const list = [];
+  for (const p of paths || []) {
+    if (!p) continue;
+    const name = p.split("/").pop();
+    const item = { kind: "file", name, path: p, size: 0, dataUrl: null };
+    if (isImageName(name)) {
+      const r = await buddy.thumb(p);
+      if (r && r.dataUrl && r.dataUrl.length < 3 * 1024 * 1024) item.dataUrl = r.dataUrl;
+      if (r && r.size) item.size = r.size;
+    }
+    list.push(item);
+  }
+  return list;
+}
+
+function renderQueue() {
+  const q = state.queue;
+  els.queueBar.hidden = q.length === 0;
+  els.queueBar.innerHTML = "";
+  q.forEach((item, i) => {
+    const row = el("div", "queue-item");
+    row.appendChild(el("span", "q-idx", String(i + 1)));
+    const t = el("span", "q-text", escapeHtml(item.text || `（${item.attachments.length} 个附件）`));
+    t.title = item.text || "";
+    row.appendChild(t);
+    const x = el("button", "q-x", "×");
+    x.title = "从队列移除";
+    x.addEventListener("click", () => {
+      state.queue.splice(i, 1);
+      renderQueue();
+    });
+    row.appendChild(x);
+    els.queueBar.appendChild(row);
+  });
+}
+
+/** 拖拽整窗投放 */
+function wireDrop() {
+  let depth = 0;
+  const show = () => (els.dropMask.hidden = false);
+  const hide = () => {
+    depth = 0;
+    els.dropMask.hidden = true;
+  };
+
+  window.addEventListener("dragenter", (e) => {
+    if (!e.dataTransfer || ![...e.dataTransfer.types].includes("Files")) return;
+    depth++;
+    show();
+  });
+  window.addEventListener("dragover", (e) => {
+    if (!e.dataTransfer || ![...e.dataTransfer.types].includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  });
+  window.addEventListener("dragleave", () => {
+    depth--;
+    if (depth <= 0) hide();
+  });
+  window.addEventListener("drop", async (e) => {
+    if (!e.dataTransfer) return;
+    e.preventDefault();
+    hide();
+    const files = [...e.dataTransfer.files];
+    if (!files.length) return;
+    const paths = files.map((f) => buddy.getPathForFile(f)).filter(Boolean);
+    if (!paths.length) return;
+    addAttachments(await stagePaths(paths));
+  });
+}
+
+/** 粘贴截图 */
+function wirePaste() {
+  els.input.addEventListener("paste", (e) => {
+    const items = [...(e.clipboardData?.items || [])];
+    const imgs = items.filter((i) => i.type && i.type.startsWith("image/"));
+    if (!imgs.length) return; // 纯文本就走默认粘贴
+    e.preventDefault();
+    for (const it of imgs) {
+      const file = it.getAsFile();
+      if (!file) continue;
+      const fr = new FileReader();
+      fr.onload = () => {
+        const ext = (it.type.split("/")[1] || "png").replace("jpeg", "jpg");
+        addAttachments([
+          {
+            kind: "dataUrl",
+            name: `粘贴的图片-${new Date().toISOString().slice(11, 19).replace(/:/g, "")}.${ext}`,
+            dataUrl: String(fr.result),
+            size: file.size,
+          },
+        ]);
+      };
+      fr.readAsDataURL(file);
+    }
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 产物面板                                                            */
+/* ------------------------------------------------------------------ */
+
+const WRITE_TOOLS = new Set([
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit",
+  "create_file",
+  "write_file",
+  "str_replace_editor",
+]);
+
+/** 从工具入参里取文件路径（兼容旧数据里的 _raw 半截 JSON） */
+function toolPath(inp) {
+  if (!inp) return "";
+  let p = inp.file_path || inp.notebook_path || inp.path;
+  if (!p && typeof inp._raw === "string") {
+    const m = /"(?:file_path|notebook_path|path)"\s*:\s*"([^"]+)"/.exec(inp._raw);
+    if (m) p = m[1];
+  }
+  return typeof p === "string" ? p : "";
+}
+
+function addArtifact(p, tool) {
+  if (!p || typeof p !== "string") return;
+  if (!p.startsWith("/")) return;
+  if (state.artifacts.has(p)) return;
+  state.artifacts.set(p, {
+    path: p,
+    name: p.split("/").pop(),
+    tool: tool || "",
+    at: Date.now(),
+  });
+  renderArtifacts();
+}
+
+function rebuildArtifacts(session) {
+  state.artifacts = new Map();
+  for (const m of session.messages || []) {
+    if (m.role !== "assistant" || !Array.isArray(m.tools)) continue;
+    for (const t of m.tools) {
+      if (!WRITE_TOOLS.has(t.name)) continue;
+      const p = toolPath(t.input);
+      if (p.startsWith("/") && !state.artifacts.has(p)) {
+        state.artifacts.set(p, { path: p, name: p.split("/").pop(), tool: t.name, at: 0 });
+      }
+    }
+  }
+  renderArtifacts();
+}
+
+function renderArtifacts() {
+  const list = [...state.artifacts.values()].sort((a, b) => (b.at || 0) - (a.at || 0));
+  els.artifactCount.hidden = list.length === 0;
+  els.artifactCount.textContent = String(list.length);
+  els.artifactEmpty.hidden = list.length > 0;
+  els.artifactList.innerHTML = "";
+
+  for (const a of list) {
+    const row = el("div", "artifact-item");
+    const ext = (a.name.split(".").pop() || "").toLowerCase();
+    row.appendChild(el("div", "a-ico", isImageName(a.name) ? "🖼" : ext.slice(0, 3) || "📄"));
+    const main = el("div", "a-main");
+    main.appendChild(el("div", "a-name", escapeHtml(a.name)));
+    const dir = a.path.slice(0, a.path.lastIndexOf("/"));
+    main.appendChild(el("div", "a-sub", escapeHtml(shortPath(dir))));
+    row.appendChild(main);
+    row.title = a.path;
+    row.addEventListener("click", () => openPreview(a.path));
+    els.artifactList.appendChild(row);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 文件预览                                                            */
+/* ------------------------------------------------------------------ */
+
+let previewPath = null;
+
+async function openPreview(p) {
+  previewPath = p;
+  els.previewTitle.textContent = p.split("/").pop() || "预览";
+  els.previewBody.innerHTML = '<div class="muted">读取中…</div>';
+  els.previewMeta.textContent = shortPath(p);
+  els.previewModal.hidden = false;
+
+  const r = await buddy.previewFile(p, state.activeId);
+  if (!r || !r.ok) {
+    els.previewBody.innerHTML = "";
+    const tip = el("div", "artifact-empty");
+    tip.textContent = (r && r.error) || "无法预览";
+    els.previewBody.appendChild(tip);
+    return;
+  }
+
+  els.previewMeta.textContent = `${shortPath(p)} · ${fmtSize(r.size)}`;
+  els.previewBody.innerHTML = "";
+
+  if (r.kind === "image") {
+    const img = new Image();
+    img.src = r.dataUrl;
+    els.previewBody.appendChild(img);
+  } else if (r.kind === "text") {
+    const pre = el("pre");
+    pre.textContent = r.text;
+    els.previewBody.appendChild(pre);
+  } else {
+    const tip = el("div", "artifact-empty");
+    tip.textContent = `${r.error || "二进制文件，不内联预览"}（${fmtSize(r.size)}）`;
+    els.previewBody.appendChild(tip);
+  }
+}
+
+function closePreview() {
+  els.previewModal.hidden = true;
+  els.previewBody.innerHTML = "";
+  previewPath = null;
+}
+
+/* ------------------------------------------------------------------ */
+/* 会话搜索                                                            */
+/* ------------------------------------------------------------------ */
+
+let searchTimer = null;
+
+function renderSearchHits() {
+  const hits = state.searchHits;
+  if (hits === null) {
+    renderSessionList();
+    return;
+  }
+  els.sessionList.innerHTML = "";
+  if (!hits.length) {
+    els.sessionList.appendChild(el("div", "artifact-empty", "没有匹配的会话"));
+    return;
+  }
+  for (const h of hits) {
+    const row = el("div", "search-hit");
+    row.innerHTML = `<div class="search-hit-title">${escapeHtml(h.title)}</div>
+      <div class="search-hit-sub">${h.snippet ? escapeHtml(h.snippet) : escapeHtml(shortPath(h.cwd || ""))}</div>`;
+    row.addEventListener("click", () => {
+      els.searchInput.value = "";
+      els.searchClear.hidden = true;
+      state.searchHits = null;
+      openSession(h.id);
+    });
+    els.sessionList.appendChild(row);
+  }
+}
+
+function wireSearch() {
+  els.searchInput.addEventListener("input", () => {
+    const q = els.searchInput.value.trim();
+    els.searchClear.hidden = !q;
+    clearTimeout(searchTimer);
+    if (!q) {
+      state.searchHits = null;
+      renderSearchHits();
+      return;
+    }
+    searchTimer = setTimeout(async () => {
+      state.searchHits = (await buddy.searchSessions(q)) || [];
+      renderSearchHits();
+    }, 180);
+  });
+
+  els.searchClear.addEventListener("click", () => {
+    els.searchInput.value = "";
+    els.searchClear.hidden = true;
+    state.searchHits = null;
+    renderSearchHits();
+    els.searchInput.focus();
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 右栏 tab                                                            */
+/* ------------------------------------------------------------------ */
+
+function switchPanelTab(name) {
+  for (const b of document.querySelectorAll(".panel-tab")) {
+    b.classList.toggle("active", b.dataset.ptab === name);
+  }
+  for (const pane of document.querySelectorAll("[data-pane]")) {
+    pane.hidden = pane.dataset.pane !== name;
   }
 }
 
@@ -1120,6 +1589,31 @@ async function bootstrap() {
 
   els.togglePanel.addEventListener("click", () => els.panel.classList.toggle("hidden"));
 
+  /* ---- 附件 / 队列 / 搜索 / 产物 ---- */
+  els.attachBtn.addEventListener("click", async () => {
+    const paths = await buddy.pickFiles();
+    if (paths && paths.length) addAttachments(await stagePaths(paths));
+  });
+
+  wireDrop();
+  wirePaste();
+  wireSearch();
+  renderAttachBar();
+  renderQueue();
+  renderArtifacts();
+
+  for (const b of document.querySelectorAll(".panel-tab")) {
+    b.addEventListener("click", () => switchPanelTab(b.dataset.ptab));
+  }
+
+  els.previewClose.addEventListener("click", closePreview);
+  els.previewModal.addEventListener("click", (e) => {
+    if (e.target === els.previewModal) closePreview();
+  });
+  els.previewOpen.addEventListener("click", () => {
+    if (previewPath) buddy.openPath(previewPath);
+  });
+
   /* ---- 定时任务 ---- */
   els.tabChats.addEventListener("click", () => switchTab("chats"));
   els.tabTasks.addEventListener("click", () => switchTab("tasks"));
@@ -1162,6 +1656,7 @@ async function bootstrap() {
 
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && !els.taskModal.hidden) closeTaskModal();
+    if (e.key === "Escape" && !els.previewModal.hidden) closePreview();
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && !els.taskModal.hidden) {
       e.preventDefault();
       saveTask();

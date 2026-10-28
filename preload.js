@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("buddy", {
   init: () => ipcRenderer.invoke("app:init"),
@@ -6,8 +6,26 @@ contextBridge.exposeInMainWorld("buddy", {
   newSession: (cwd) => ipcRenderer.invoke("session:new", cwd),
   loadSession: (id) => ipcRenderer.invoke("session:load", id),
   deleteSession: (id) => ipcRenderer.invoke("session:delete", id),
-  send: (id, text) => ipcRenderer.invoke("session:send", { id, text }),
+  send: (id, text, attachments) => ipcRenderer.invoke("session:send", { id, text, attachments }),
   stop: (id) => ipcRenderer.invoke("session:stop", id),
+
+  // 附件：选文件 / 导入已选路径 / 存粘贴的图 / 只读预览
+  pickFiles: () => ipcRenderer.invoke("file:pick"),
+  // Electron 20+ 删了 File.path，拖进来的文件只能从这里取真实路径
+  getPathForFile: (file) => {
+    try {
+      return webUtils.getPathForFile(file);
+    } catch {
+      return "";
+    }
+  },
+  attachFiles: (sessionId, paths) => ipcRenderer.invoke("attachment:import", { sessionId, paths }),
+  attachDataUrl: (sessionId, name, dataUrl) =>
+    ipcRenderer.invoke("attachment:saveDataUrl", { sessionId, name, dataUrl }),
+  previewFile: (p, sessionId) => ipcRenderer.invoke("file:preview", { path: p, sessionId }),
+  thumb: (p) => ipcRenderer.invoke("attachment:thumb", p),
+
+  searchSessions: (q) => ipcRenderer.invoke("session:search", q),
 
   listTasks: () => ipcRenderer.invoke("task:list"),
   saveTask: (input) => ipcRenderer.invoke("task:save", input),

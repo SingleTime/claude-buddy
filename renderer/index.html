@@ -20,6 +20,10 @@
               定时任务<span class="tab-count" id="taskCount" hidden>0</span>
             </button>
           </div>
+          <div class="search-box">
+            <input id="searchInput" type="search" placeholder="搜索会话与消息…" spellcheck="false" />
+            <button class="search-clear" id="searchClear" hidden>×</button>
+          </div>
         </div>
 
         <div class="sidebar-body" id="paneChats">
@@ -69,16 +73,23 @@
 
         <div class="composer">
           <div class="composer-inner">
+            <div class="queue-bar" id="queueBar" hidden></div>
+            <div class="attach-bar" id="attachBar" hidden></div>
             <textarea
               id="input"
               rows="1"
-              placeholder="问点什么，或者让它动手干活…"
+              placeholder="问点什么，或者让它动手干活…（可拖入文件、粘贴截图）"
               spellcheck="false"
               autofocus
             ></textarea>
             <div class="composer-bar">
               <span class="hint" id="hint">Enter 发送 · Shift+Enter 换行</span>
               <div class="composer-right">
+                <button class="btn-attach" id="attachBtn" title="添加附件（也可以拖进来或直接粘图）">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
+                  </svg>
+                </button>
                 <button class="btn-stop" id="stopBtn" hidden>停止</button>
                 <button class="btn-send" id="sendBtn">发送</button>
               </div>
@@ -87,50 +98,84 @@
         </div>
       </main>
 
-      <!-- 右：状态面板 -->
+      <!-- 右：状态 / 产物 -->
       <aside class="panel" id="panel">
-        <div class="panel-section">
-          <div class="panel-label">模型</div>
-          <select id="modelSelect" class="select">
-            <option value="">默认（settings.json）</option>
-            <option value="qwen3.8-flash">qwen3.8-flash</option>
-            <option value="qwen3.8-max">qwen3.8-max</option>
-            <option value="deepseek-v4.1-flash">deepseek-v4.1-flash</option>
-            <option value="deepseek-v4-pro">deepseek-v4-pro</option>
-          </select>
+        <div class="panel-tabs">
+          <button class="panel-tab active" data-ptab="status">状态</button>
+          <button class="panel-tab" data-ptab="artifacts">
+            产物<span class="tab-count" id="artifactCount" hidden>0</span>
+          </button>
         </div>
 
-        <div class="panel-section">
-          <div class="panel-label">权限模式</div>
-          <select id="modeSelect" class="select">
-            <option value="default">default（逐次确认）</option>
-            <option value="plan">plan（只读规划）</option>
-            <option value="acceptEdits">acceptEdits（自动改文件）</option>
-            <option value="bypassPermissions">bypass（全放行）</option>
-          </select>
+        <div data-pane="status">
+          <div class="panel-section">
+            <div class="panel-label">模型</div>
+            <select id="modelSelect" class="select">
+              <option value="">默认（settings.json）</option>
+              <option value="qwen3.8-flash">qwen3.8-flash</option>
+              <option value="qwen3.8-max">qwen3.8-max</option>
+              <option value="deepseek-v4.1-flash">deepseek-v4.1-flash</option>
+              <option value="deepseek-v4-pro">deepseek-v4-pro</option>
+            </select>
+          </div>
+
+          <div class="panel-section">
+            <div class="panel-label">权限模式</div>
+            <select id="modeSelect" class="select">
+              <option value="default">default（逐次确认）</option>
+              <option value="plan">plan（只读规划）</option>
+              <option value="acceptEdits">acceptEdits（自动改文件）</option>
+              <option value="bypassPermissions">bypass（全放行）</option>
+            </select>
+          </div>
+
+          <div class="panel-section">
+            <div class="panel-label">本会话</div>
+            <div class="stat-row"><span>轮次成本</span><b id="statCost">$0.0000</b></div>
+            <div class="stat-row"><span>累计成本</span><b id="statTotalCost">$0.0000</b></div>
+            <div class="stat-row"><span>输入 tokens</span><b id="statIn">0</b></div>
+            <div class="stat-row"><span>缓存命中</span><b id="statCache">0</b></div>
+            <div class="stat-row"><span>输出 tokens</span><b id="statOut">0</b></div>
+            <div class="stat-row"><span>耗时</span><b id="statDur">—</b></div>
+          </div>
+
+          <div class="panel-section">
+            <div class="panel-label">可用工具 <span id="toolCount" class="muted">0</span></div>
+            <div class="tool-tags" id="toolTags"></div>
+          </div>
+
+          <div class="panel-section">
+            <div class="panel-label">运行状态</div>
+            <div class="stat-row"><span>进程</span><b id="statProc">未启动</b></div>
+            <div class="stat-row"><span>会话 ID</span><b id="statSid" class="mono">—</b></div>
+          </div>
         </div>
 
-        <div class="panel-section">
-          <div class="panel-label">本会话</div>
-          <div class="stat-row"><span>轮次成本</span><b id="statCost">$0.0000</b></div>
-          <div class="stat-row"><span>累计成本</span><b id="statTotalCost">$0.0000</b></div>
-          <div class="stat-row"><span>输入 tokens</span><b id="statIn">0</b></div>
-          <div class="stat-row"><span>缓存命中</span><b id="statCache">0</b></div>
-          <div class="stat-row"><span>输出 tokens</span><b id="statOut">0</b></div>
-          <div class="stat-row"><span>耗时</span><b id="statDur">—</b></div>
-        </div>
-
-        <div class="panel-section">
-          <div class="panel-label">可用工具 <span id="toolCount" class="muted">0</span></div>
-          <div class="tool-tags" id="toolTags"></div>
-        </div>
-
-        <div class="panel-section">
-          <div class="panel-label">运行状态</div>
-          <div class="stat-row"><span>进程</span><b id="statProc">未启动</b></div>
-          <div class="stat-row"><span>会话 ID</span><b id="statSid" class="mono">—</b></div>
+        <div data-pane="artifacts" hidden>
+          <div class="artifact-empty" id="artifactEmpty">这个会话还没产出文件</div>
+          <div class="artifact-list" id="artifactList"></div>
         </div>
       </aside>
+    </div>
+
+    <!-- 拖拽投放遮罩 -->
+    <div class="drop-mask" id="dropMask" hidden>
+      <div class="drop-inner">松手，丢给它</div>
+    </div>
+
+    <!-- 文件预览 -->
+    <div class="modal-mask" id="previewModal" hidden>
+      <div class="modal preview-modal">
+        <div class="modal-head">
+          <span id="previewTitle">预览</span>
+          <button class="modal-x" id="previewClose">×</button>
+        </div>
+        <div class="modal-body preview-body" id="previewBody"></div>
+        <div class="modal-foot preview-foot">
+          <span class="muted" id="previewMeta"></span>
+          <button class="btn-ghost" id="previewOpen">用默认程序打开</button>
+        </div>
+      </div>
     </div>
 
     <!-- 定时任务编辑弹窗 -->

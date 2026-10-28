@@ -27,6 +27,10 @@ contextBridge.exposeInMainWorld("buddy", {
 
   searchSessions: (q) => ipcRenderer.invoke("session:search", q),
 
+  // MCP：只读配置 + 运行时连接状态
+  mcpList: (cwd) => ipcRenderer.invoke("mcp:list", cwd),
+  openConfig: (which) => ipcRenderer.invoke("shell:openConfig", which),
+
   listTasks: () => ipcRenderer.invoke("task:list"),
   saveTask: (input) => ipcRenderer.invoke("task:save", input),
   deleteTask: (id) => ipcRenderer.invoke("task:delete", id),

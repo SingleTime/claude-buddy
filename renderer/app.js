@@ -25,6 +25,7 @@ const els = {
   statOut: $("statOut"),
   statDur: $("statDur"),
   statProc: $("statProc"),
+  statConc: $("statConc"),
   statSid: $("statSid"),
   toolTags: $("toolTags"),
   toolCount: $("toolCount"),
@@ -62,6 +63,19 @@ const els = {
   previewMeta: $("previewMeta"),
   previewOpen: $("previewOpen"),
   previewClose: $("previewClose"),
+  // 上下文占用
+  ctxPct: $("ctxPct"),
+  ctxBar: $("ctxBar"),
+  ctxFill: $("ctxFill"),
+  ctxText: $("ctxText"),
+  compactBtn: $("compactBtn"),
+  // MCP
+  mcpCount: $("mcpCount"),
+  mcpList: $("mcpList"),
+  mcpEmpty: $("mcpEmpty"),
+  mcpCwd: $("mcpCwd"),
+  mcpRefresh: $("mcpRefresh"),
+  mcpFoot: $("mcpFoot"),
 };
 
 const state = {
@@ -80,6 +94,7 @@ const state = {
   artifacts: new Map(), // 本会话产出的文件 path -> meta
   searchHits: null, // 非 null 表示正在展示搜索结果
   bg: null, // 后台守护状态（launchd）
+  slotWait: null, // 并发满、正等进程位（{current, max}）
 };
 
 /* ------------------------------------------------------------------ */
@@ -470,6 +485,9 @@ function onEvent(evt) {
       els.statSid.title = evt.claudeSessionId || "";
       if (evt.model) els.modelBadge.textContent = evt.model;
       renderTools(evt.tools || []);
+      // init 是 MCP 连接状态的唯一真实来源，每一轮都会带最新的一份
+      if (evt.mcp) renderMcp(evt.mcp);
+      if (evt.runners) updateConc(evt.runners);
       break;
     }
 
@@ -592,12 +610,17 @@ function onEvent(evt) {
         t.body.appendChild(meta);
       }
       if (evt.totals) updateStats(evt.totals);
+      if (evt.context) {
+        applyContext(evt.context);
+        if (state.active) state.active.context = evt.context;
+      }
       els.statCost.textContent = fmtCost(evt.cost);
       els.statDur.textContent = fmtDur(evt.durationMs);
       if (evt.isError) {
         appendError("本轮返回错误状态：" + (evt.stopReason || "unknown"));
       }
       state.busy = false;
+      state.slotWait = null;
       updateBusy();
       endTurn();
       scrollIfNear(wasNear);
@@ -606,9 +629,26 @@ function onEvent(evt) {
       break;
     }
 
+    case "slot_wait": {
+      // 并发满了在排队。这不是错误，不要解除 busy —— 一旦解除，本地队列会
+      // 立刻把下一条也发出去，越排越多。
+      state.slotWait = { current: evt.current, max: evt.max };
+      updateBusy();
+      break;
+    }
+
+    case "artifacts_diff": {
+      // 文件系统快照 diff 出来的变更：Bash 重定向、脚本生成、格式化工具改的
+      // 文件都走这条路，补的是 tool_use 的 file_path 覆盖不到的那部分
+      for (const p of evt.added || []) addArtifact(p, "fs:new");
+      for (const p of evt.changed || []) addArtifact(p, "fs:mod");
+      break;
+    }
+
     case "error": {
       appendError(evt.message);
       state.busy = false;
+      state.slotWait = null;
       updateBusy();
       endTurn();
       break;
@@ -710,6 +750,8 @@ async function openSession(id) {
   els.statSid.textContent = (s.sessionId || "").slice(0, 8) || "—";
 
   updateStats(s.totals || { cost: 0, inputTokens: 0, outputTokens: 0, cacheRead: 0 });
+  applyContext(s.context || null);
+  state.slotWait = null;
 
   clearMessages();
   state.queue = [];
@@ -728,6 +770,8 @@ async function openSession(id) {
   renderSessionList();
   updateBusy();
   els.input.focus();
+  // 每个会话的 cwd 可能不同，MCP 作用域跟着变
+  refreshMcp();
 }
 
 async function newSession() {
@@ -745,6 +789,10 @@ function updateBusy() {
   els.sendBtn.disabled = false; // 忙碌时也点得动 —— 点了就是排队
   els.sendBtn.textContent = state.busy ? "排队" : "发送";
   els.stopBtn.hidden = !state.busy;
+  if (state.slotWait) {
+    els.hint.textContent = `同时在跑的会话已有 ${state.slotWait.max} 个，排队等位中…`;
+    return;
+  }
   els.hint.textContent = state.busy
     ? "正在生成… 现在发送会排进队列，等这轮结束自动接着发"
     : "Enter 发送 · Shift+Enter 换行 · 可拖入文件或粘贴截图";
@@ -1070,6 +1118,120 @@ function renderArtifacts() {
 }
 
 /* ------------------------------------------------------------------ */
+/* 上下文占用                                                          */
+/* ------------------------------------------------------------------ */
+
+function fmtTokens(n) {
+  if (!n) return "0";
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + "M";
+  if (n >= 1000) return Math.round(n / 1000) + "k";
+  return String(n);
+}
+
+/**
+ * 上下文占用条。
+ *
+ * 这个数不是成本：成本只看这一轮新增了多少，占用看的是"整个历史一次次
+ * 累进喂进去"的总量。resume 模式下它只增不减，直到超过窗口报错为止 ——
+ * 所以必须能提前看见，否则用户只会遇到一个莫名其妙的失败。
+ */
+function applyContext(ctx) {
+  if (!ctx || !ctx.limit) {
+    els.ctxFill.style.width = "0%";
+    els.ctxBar.classList.remove("warn", "danger");
+    els.ctxPct.textContent = "—";
+    els.ctxText.textContent = "还没跑过";
+    return;
+  }
+  const pct = Math.max(0, Math.min(100, (ctx.used / ctx.limit) * 100));
+  els.ctxFill.style.width = pct.toFixed(1) + "%";
+  els.ctxBar.classList.toggle("warn", pct >= 70 && pct < 90);
+  els.ctxBar.classList.toggle("danger", pct >= 90);
+  els.ctxPct.textContent = pct >= 10 ? pct.toFixed(0) + "%" : pct.toFixed(1) + "%";
+  els.ctxText.textContent = `${fmtTokens(ctx.used)} / ${fmtTokens(ctx.limit)}`;
+}
+
+/* ------------------------------------------------------------------ */
+/* MCP 面板                                                            */
+/* ------------------------------------------------------------------ */
+
+function updateConc(r) {
+  if (!r) return;
+  els.statConc.textContent = `${r.current} / ${r.max}`;
+  els.statConc.style.color = r.current >= r.max ? "var(--yellow)" : "";
+  els.statConc.title =
+    r.current >= r.max
+      ? "已满，新会话会排队等位（可在 sessions.json 里改 config.maxConcurrent）"
+      : `空闲 ${r.max - r.current} 个位置`;
+}
+
+const SCOPE_LABEL = { user: "user", local: "local", project: "project", "?": "未运行" };
+
+/* 只有明确失败才算红。pending 是连接中的过渡态，标红会让人以为配错了。 */
+const MCP_BAD = /fail|error|needs.?auth|unauthor|denied|timeout|refused/i;
+const MCP_WAIT = /pending|connect|starting|init/i;
+
+function mcpState(status) {
+  if (!status) return "unknown";
+  if (MCP_BAD.test(status)) return "bad";
+  if (/^connected$|^ok$|^ready$/i.test(status)) return "ok";
+  if (MCP_WAIT.test(status)) return "warn";
+  return "ok";
+}
+
+function renderMcp(data) {
+  const servers = (data && data.servers) || [];
+  els.mcpCount.hidden = servers.length === 0;
+  els.mcpCount.textContent = String(servers.length);
+  els.mcpEmpty.hidden = servers.length > 0;
+  els.mcpList.innerHTML = "";
+  els.mcpCwd.textContent = data && data.cwd ? shortPath(data.cwd) : "—";
+
+  const bad = servers.filter((s) => mcpState(s.status) === "bad");
+  const waiting = servers.filter((s) => mcpState(s.status) === "warn");
+
+  for (const s of servers) {
+    const state = mcpState(s.status);
+    const item = el("div", "mcp-item");
+    if (state === "bad") item.classList.add("failed");
+
+    const row = el("div", "mcp-row");
+    row.appendChild(el("span", "mcp-name", escapeHtml(s.name)));
+    row.appendChild(el("span", "mcp-tag", escapeHtml(SCOPE_LABEL[s.scope] || s.scope)));
+    if (s.transport) row.appendChild(el("span", "mcp-tag", escapeHtml(s.transport)));
+    const dot = el("span", "mcp-dot");
+    if (state !== "unknown") dot.classList.add(state);
+    dot.title = s.status || "还没跑过一轮，状态未知";
+    row.appendChild(dot);
+    item.appendChild(row);
+
+    if (s.target) item.appendChild(el("div", "mcp-cmd", escapeHtml(s.target)));
+    if (s.status) {
+      const st = el("div", "mcp-cmd", escapeHtml(String(s.status)));
+      if (state === "bad") st.style.color = "var(--red)";
+      item.appendChild(st);
+    }
+    els.mcpList.appendChild(item);
+  }
+
+  // 配了但一轮都没跑过时，状态列全是灰点，得说清楚为什么
+  const untouched = servers.length > 0 && servers.every((s) => !s.status);
+  els.mcpFoot.innerHTML = untouched
+    ? "灰点＝还没跑过一轮。<br />连接状态只有 claude 自己知道，发一条消息后就会显示。"
+    : bad.length
+      ? `<span style="color:var(--red)">${bad.length} 个连不上</span>，检查命令行或凭据后点重扫。`
+      : waiting.length
+        ? `${waiting.length} 个正在连接…`
+        : "";
+}
+
+async function refreshMcp() {
+  const cwd = (state.active && state.active.cwd) || state.config.cwd;
+  const data = await buddy.mcpList(cwd);
+  renderMcp(data);
+}
+
+/* ------------------------------------------------------------------ */
 /* 文件预览                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -1182,6 +1344,8 @@ function switchPanelTab(name) {
   for (const pane of document.querySelectorAll("[data-pane]")) {
     pane.hidden = pane.dataset.pane !== name;
   }
+  // MCP 配置可能刚在终端里改过，每次点进来重扫一次比缓存更可靠
+  if (name === "mcp") refreshMcp();
 }
 
 function autoGrow() {
@@ -1646,6 +1810,7 @@ async function bootstrap() {
   state.bg = init.bg || null;
   renderTaskList();
   renderBg();
+  if (init.runners) updateConc(init.runners);
 
   els.cwdLabel.textContent = shortPath(init.config.cwd || "~");
   els.cwdLabel.title = init.config.cwd;
@@ -1704,6 +1869,21 @@ async function bootstrap() {
   });
 
   els.togglePanel.addEventListener("click", () => els.panel.classList.toggle("hidden"));
+
+  /* ---- 上下文 / MCP ---- */
+  els.compactBtn.addEventListener("click", () => {
+    // /compact 是 claude 自己的斜杠命令，走普通消息通道即可，不需要额外 IPC
+    if (!state.activeId) return;
+    send("/compact");
+  });
+  els.mcpRefresh.addEventListener("click", async () => {
+    els.mcpRefresh.disabled = true;
+    try {
+      await refreshMcp();
+    } finally {
+      els.mcpRefresh.disabled = false;
+    }
+  });
 
   /* ---- 附件 / 队列 / 搜索 / 产物 ---- */
   els.attachBtn.addEventListener("click", async () => {

@@ -17,6 +17,7 @@ const crypto = require("node:crypto");
 const claudeBin = require("./lib/claude-bin");
 const { computeNext, TASK_TIMEOUT_MS } = require("./lib/schedule");
 const launchd = require("./lib/launchd");
+const { snapshotTree, diffTree } = require("./lib/artifacts");
 
 app.setName("Claude Buddy");
 
@@ -231,9 +232,32 @@ function createSession(cwd) {
 /* claude 子进程管理                                                    */
 /* ------------------------------------------------------------------ */
 
-/** sessionLocalId -> { proc, buf, stderr, pending } */
+/** sessionLocalId -> { proc, buf, stderr, session, busy, lastActive, idleTimer } */
 const runners = new Map();
 let mainWindow = null;
+
+/* 并发模型
+ *
+ * 0.4.x 里每开一个新会话进程就 killOthers()，实际并发恒为 1：在 A 会话跑长
+ * 任务，切到 B 发一句话，A 的子进程当场被杀，A 那边的轮次永远等不到 result，
+ * 界面一直卡在"正在生成"。这不是"并发无上限"，是"并发被硬关掉了"。
+ *
+ * 现在按容量来：同时最多 DEFAULT_MAX_CONCURRENT 个常驻进程，满了先踢最久
+ * 没动静的空闲进程；全都忙着就排队等位，最多 SPOT_WAIT_MS。
+ * 一轮结束后进程不会立刻退出（下次还能复用），空闲超 IDLE_TTL_MS 才回收，
+ * 否则每次发消息都要重走一遍 claude 的启动开销。
+ */
+const DEFAULT_MAX_CONCURRENT = 3;
+const IDLE_TTL_MS = 5 * 60 * 1000;
+const SLOT_WAIT_MS = 90 * 1000;
+
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+function maxConcurrent() {
+  const n = Number(store.config.maxConcurrent);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_MAX_CONCURRENT;
+  return Math.max(1, Math.min(8, Math.floor(n)));
+}
 
 function emit(payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -252,16 +276,88 @@ function killAllRunners() {
   runners.clear();
 }
 
-function killOthers(keepId) {
-  for (const [id, r] of [...runners]) {
-    if (id === keepId) continue;
+/** 还活着、能直接写入的进程 */
+function liveRunner(sessionId) {
+  const r = runners.get(sessionId);
+  if (!r || !r.proc || r.proc.killed || r.proc.exitCode !== null) return null;
+  clearTimeout(r.idleTimer);
+  r.idleTimer = null;
+  return r;
+}
+
+/** 腾一个位置出来：优先踢最久没动静的空闲进程 */
+function makeRoom() {
+  if (runners.size < maxConcurrent()) return true;
+  const idle = [...runners.entries()]
+    .filter(([, r]) => !r.busy && r.proc && !r.proc.killed && r.proc.exitCode === null)
+    .sort((a, b) => (a[1].lastActive || 0) - (b[1].lastActive || 0));
+  if (!idle.length) return false;
+  const [id, r] = idle[0];
+  clearTimeout(r.idleTimer);
+  try {
+    r.proc.kill("SIGTERM");
+  } catch {
+    /* ignore */
+  }
+  runners.delete(id);
+  return true;
+}
+
+/**
+ * 拿一个可写进程，满了就等位。
+ * 返回 null 表示 spawn 真的失败（不是等不到位置）。
+ */
+async function acquireRunner(session) {
+  const deadline = Date.now() + SLOT_WAIT_MS;
+  for (;;) {
+    const existing = liveRunner(session.id);
+    if (existing) return existing;
+    if (makeRoom()) return spawnRunner(session);
+    if (Date.now() >= deadline) {
+      emit({
+        type: "error",
+        sessionId: session.id,
+        message: `已到并发上限（${maxConcurrent()} 个会话同时在跑），排队 ${Math.round(
+          SLOT_WAIT_MS / 1000,
+        )} 秒仍没有空位。等手头的跑完再发，或在设置里调高并发数。`,
+      });
+      return null;
+    }
+    emit({
+      type: "slot_wait",
+      sessionId: session.id,
+      current: runners.size,
+      max: maxConcurrent(),
+    });
+    await sleep(1000);
+  }
+}
+
+/** 一轮收尾：放开 busy，起空闲回收计时 */
+function releaseRunner(sessionId) {
+  const r = runners.get(sessionId);
+  if (!r) return;
+  r.busy = false;
+  r.lastActive = Date.now();
+  clearTimeout(r.idleTimer);
+  r.idleTimer = setTimeout(() => {
+    const cur = runners.get(sessionId);
+    if (!cur || cur !== r || cur.busy) return;
     try {
-      r.proc.kill("SIGTERM");
+      cur.proc.kill("SIGTERM");
     } catch {
       /* ignore */
     }
-    runners.delete(id);
-  }
+    runners.delete(sessionId);
+  }, IDLE_TTL_MS);
+  if (r.idleTimer.unref) r.idleTimer.unref();
+}
+
+function getRunner(session) {
+  const existing = liveRunner(session.id);
+  if (existing) return existing;
+  if (!makeRoom()) return null;
+  return spawnRunner(session);
 }
 
 function spawnRunner(session, overrides = {}) {
@@ -311,7 +407,16 @@ function spawnRunner(session, overrides = {}) {
     return null;
   }
 
-  const runner = { proc, buf: "", stderr: "", session };
+  const runner = {
+    proc,
+    buf: "",
+    stderr: "",
+    session,
+    busy: false,
+    lastActive: Date.now(),
+    idleTimer: null,
+    snap: null, // 本轮起跑前的文件快照，用来算产物
+  };
   runners.set(session.id, runner);
 
   proc.stdout.setEncoding("utf8");
@@ -365,15 +470,6 @@ function spawnRunner(session, overrides = {}) {
   });
 
   return runner;
-}
-
-function getRunner(session) {
-  const existing = runners.get(session.id);
-  if (existing && existing.proc && !existing.proc.killed && existing.proc.exitCode === null) {
-    return existing;
-  }
-  killOthers(session.id);
-  return spawnRunner(session);
 }
 
 function killRunner(sessionId) {
@@ -446,6 +542,13 @@ function handleClaudeEvent(session, e) {
       if (e.subtype === "init") {
         session.sessionId = e.session_id;
         session.model = e.model || session.model;
+        // MCP 的真实连接状态只有这里能拿到：配置文件只说明"配了"
+        if (Array.isArray(e.mcp_servers)) {
+          mcpRuntime.clear();
+          for (const m of e.mcp_servers) {
+            if (m && m.name) mcpRuntime.set(m.name, m);
+          }
+        }
         saveStore();
         emit({
           type: "init",
@@ -454,6 +557,8 @@ function handleClaudeEvent(session, e) {
           model: e.model,
           cwd: e.cwd,
           tools: e.tools || [],
+          mcp: collectMcp(session.cwd),
+          runners: { current: runners.size, max: maxConcurrent() },
         });
       } else if (e.subtype === "thinking_tokens") {
         emit({ type: "thinking_tokens", sessionId: sid, tokens: e.estimated_tokens });
@@ -507,8 +612,17 @@ function handleClaudeEvent(session, e) {
       session.totals.inputTokens += u.input_tokens || 0;
       session.totals.outputTokens += u.output_tokens || 0;
       session.totals.cacheRead += u.cache_read_input_tokens || 0;
+      session.totals.cacheCreate = (session.totals.cacheCreate || 0) + (u.cache_creation_input_tokens || 0);
       if (!session.sessionId && e.session_id) session.sessionId = e.session_id;
       session.updatedAt = Date.now();
+
+      // 上下文占用 = 这一轮真正喂进去的全部 token（新输入 + 命中缓存 + 写入缓存）。
+      // 每一轮都 --resume 把历史全带上，所以这个数就是"窗口有多满"，和轮次成本
+      // 不是一回事 —— 成本只看新增，占用看总量。
+      const ctxUsed =
+        (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+      const ctxLimit = contextLimitFor(session.model);
+      session.context = { used: ctxUsed, limit: ctxLimit, at: Date.now() };
 
       // 组装本轮 assistant 消息并持久化
       const st = turnOf(sid);
@@ -541,10 +655,15 @@ function handleClaudeEvent(session, e) {
         durationMs: e.duration_api_ms,
         usage: u,
         totals: session.totals,
+        context: session.context,
         isError: !!e.is_error,
         stopReason: e.stop_reason,
         turnText: st.text,
       });
+
+      // 产物与并发位在收口时一起放掉
+      collectArtifacts(session, sid);
+      releaseRunner(sid);
 
       // 若是定时任务触发的这一轮，回收结果并更新任务状态
       finishTaskRun(sid, { ok: !e.is_error, text: st.text, cost, error: e.stop_reason });
@@ -1232,7 +1351,142 @@ function previewFile(filePath, sessionId) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 发送消息                                                            */
+/* MCP                                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * MCP 的配置有三个作用域，散在两个文件里：
+ *   user    → ~/.claude.json 顶层 mcpServers
+ *   local   → ~/.claude.json 里 projects["<cwd>"].mcpServers
+ *   project → <cwd>/.mcp.json（团队共享，进版本控制）
+ *
+ * 这里只读不写。改配置仍然交给 `claude mcp add` 和编辑器 —— 应用去改写
+ * 别人的全局配置，出错时用户根本不知道是哪个工具动的。
+ *
+ * 连接状态没法从文件里看出来，只能等 claude 自己说：system/init 事件带的
+ * mcp_servers 是唯一的真实来源，没跑过一轮就没有状态。所以面板要区分
+ * "配了" 和 "连上了" 两件事。
+ */
+const CLAUDE_JSON_PATH = path.join(os.homedir(), ".claude.json");
+const mcpRuntime = new Map(); // name -> { name, status }
+
+function readJsonSafe(p) {
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function describeMcp(name, cfg, scope) {
+  if (!cfg || typeof cfg !== "object") return null;
+  const transport = cfg.type || (cfg.url ? "http" : "stdio");
+  const raw =
+    cfg.url || [cfg.command, ...(Array.isArray(cfg.args) ? cfg.args : [])].filter(Boolean).join(" ");
+  return {
+    name,
+    scope,
+    transport,
+    target: String(raw || "").slice(0, 200),
+    disabled: !!cfg.disabled,
+  };
+}
+
+function collectMcp(cwd) {
+  const found = new Map();
+  const put = (n, cfg, scope) => {
+    const rec = describeMcp(n, cfg, scope);
+    if (rec) found.set(n, rec);
+  };
+
+  const global = readJsonSafe(CLAUDE_JSON_PATH);
+  if (global && global.mcpServers && typeof global.mcpServers === "object") {
+    for (const [n, c] of Object.entries(global.mcpServers)) put(n, c, "user");
+  }
+  const proj = global && cwd && global.projects ? global.projects[cwd] : null;
+  if (proj && proj.mcpServers && typeof proj.mcpServers === "object") {
+    for (const [n, c] of Object.entries(proj.mcpServers)) put(n, c, "local");
+  }
+
+  const dotMcp = cwd ? readJsonSafe(path.join(cwd, ".mcp.json")) : null;
+  if (dotMcp && dotMcp.mcpServers && typeof dotMcp.mcpServers === "object") {
+    for (const [n, c] of Object.entries(dotMcp.mcpServers)) put(n, c, "project");
+  }
+
+  // 运行时状态盖上去；配了但没连上的，status 是 failed / pending 之类
+  for (const [n, m] of mcpRuntime) {
+    const rec = found.get(n) || { name: n, scope: "?", transport: "?", target: "", disabled: false };
+    rec.status = m.status || "unknown";
+    found.set(n, rec);
+  }
+
+  return {
+    servers: [...found.values()].sort((a, b) => a.name.localeCompare(b.name)),
+    paths: {
+      global: CLAUDE_JSON_PATH,
+      project: cwd ? path.join(cwd, ".mcp.json") : "",
+    },
+    cwd: cwd || "",
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* 上下文占用与产物快照                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 模型的上下文窗口。
+ *
+ * 只在"用了多少"这件事上有意义，算错不会崩，但会让进度条给出错误的安心感。
+ * 查不到的按 Claude 的 200k 兜底（偏保守）；config.contextLimit 可以硬覆盖。
+ */
+const MODEL_CONTEXT = [
+  [/qwen3\.[6-9]/i, 1_000_000],
+  [/deepseek/i, 128_000],
+  [/\[1m\]/i, 1_000_000],
+];
+
+function contextLimitFor(model) {
+  const override = Number(store.config.contextLimit);
+  if (Number.isFinite(override) && override > 0) return override;
+  const m = String(model || "");
+  for (const [re, n] of MODEL_CONTEXT) if (re.test(m)) return n;
+  return 200_000;
+}
+
+/**
+ * 一轮结束后算产物。
+ *
+ * 对比的是轮次前后的文件系统快照，所以 `python gen.py`、`prettier --write`、
+ * `> out.txt` 这类不经过 Write 工具、也没有 file_path 参数的写入同样能进面板。
+ * 细节见 lib/artifacts.js。
+ *
+ * 两次扫描都截断过就放弃：扫描集合不同会被当成"新增"，误报比漏报更烦。
+ */
+function collectArtifacts(session, sid) {
+  const r = runners.get(sid);
+  const before = r && r.snap;
+  if (r) r.snap = null;
+  if (!before || before.files.size === 0) return;
+  snapshotTree(session.cwd || os.homedir())
+    .then((after) => {
+      if (before.truncated && after.truncated) return;
+      const { added, changed } = diffTree(before, after);
+      if (!added.length && !changed.length) return;
+      emit({
+        type: "artifacts_diff",
+        sessionId: sid,
+        added: added.slice(0, 200),
+        changed: changed.slice(0, 200),
+      });
+    })
+    .catch(() => {
+      /* 扫不出来就算了，工具卡片里的路径仍然有效 */
+    });
+}
+
+/* ------------------------------------------------------------------ */
+/* 发送                                                                */
 /* ------------------------------------------------------------------ */
 
 async function sendMessage(session, text, attachments) {
@@ -1256,8 +1510,16 @@ async function sendMessage(session, text, attachments) {
   session.updatedAt = Date.now();
   saveStore();
 
-  const runner = getRunner(session);
+  const runner = await acquireRunner(session);
   if (!runner) return { ok: false, error: "子进程启动失败" };
+  runner.busy = true;
+  runner.lastActive = Date.now();
+  clearTimeout(runner.idleTimer);
+  runner.idleTimer = null;
+
+  // 起跑前记一份文件快照，轮次结束后做 diff 才知道这一轮到底写了什么。
+  // 只认 Write/Edit 的 file_path 会漏掉 Bash 重定向、脚本生成、格式化工具改的文件。
+  runner.snap = await snapshotTree(session.cwd || os.homedir()).catch(() => null);
 
   // 图片走 content block 内联（模型直接看见），其他文件给路径让 Read 自己读
   const content = [{ type: "text", text: body }];
@@ -1642,6 +1904,7 @@ app.whenReady().then(() => {
       cwd: s.cwd,
       updatedAt: s.updatedAt,
       totals: s.totals,
+      context: s.context || null,
     })),
     activeId: store.activeId,
     config: store.config,
@@ -1650,7 +1913,23 @@ app.whenReady().then(() => {
     platform: process.platform,
     claudeBin: CLAUDE_BIN,
     bg: bgInfo(),
+    runners: { current: runners.size, max: maxConcurrent() },
   }));
+
+  /* ---------------- MCP ---------------- */
+
+  ipcMain.handle("mcp:list", (_e, cwd) => {
+    const target = cwd || (store.activeId ? (getSession(store.activeId) || {}).cwd : "") || store.config.cwd;
+    return collectMcp(target);
+  });
+
+  // 改配置不改文件，只把命令行打到界面上让用户自己复制执行
+  ipcMain.handle("shell:openConfig", (_e, which) => {
+    const p = which === "project" ? path.join(store.config.cwd || os.homedir(), ".mcp.json") : CLAUDE_JSON_PATH;
+    if (!fs.existsSync(p)) return { ok: false, error: "文件还不存在" };
+    shell.openPath(p);
+    return { ok: true };
+  });
 
   /* ---------------- 定时任务 ---------------- */
 
@@ -1908,12 +2187,17 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("config:update", (_e, patch) => {
+    const prev = store.config;
     store.config = { ...store.config, ...patch };
     saveStore();
-    // 配置变了，重启活跃进程以生效
-    const active = getSession(store.activeId);
-    if (active) {
-      const r = runners.get(active.id);
+    // 只有进了 argv 的配置才值得重起进程。maxConcurrent / contextLimit 这类
+    // 改完立刻生效，没必要把正在跑的那一轮打断。
+    const restart = ["model", "permissionMode", "cwd"].some(
+      (k) => patch[k] !== undefined && patch[k] !== prev[k],
+    );
+    if (restart) {
+      const active = getSession(store.activeId);
+      const r = active && runners.get(active.id);
       if (r) {
         try {
           r.proc.kill("SIGTERM");

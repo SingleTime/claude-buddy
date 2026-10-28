@@ -54,7 +54,10 @@ The trade-off is an immature ecosystem: no expert marketplace, no cross-device s
 - **Thinking blocks** — collapsible, expandable
 - **Tool cards** — tool name, argument JSON, result, success/failure state, collapsible
 - **Attachments** — drag in, click the paperclip, or `⌘V` a screenshot; images go to the model as inline content blocks, other files land in the session directory and are handed to `Read`
-- **Artifact panel** — right sidebar lists every file written this turn; images and text preview inline, everything else opens in the system app
+- **Artifact panel** — right sidebar lists every file touched this turn. Detected by diffing a filesystem snapshot taken before and after the turn, so files produced by `Bash` redirection, a script run, or a formatter appear too — not just the ones with a `file_path` argument. Images and text preview inline, everything else opens in the system app
+- **Context gauge** — the right panel shows how full the context window is (input + cache read + cache write for the latest turn) with a three-stage bar and a `Compact` button that sends `/compact`
+- **MCP panel** — every configured server with its scope (`user` / `local` / `project`), transport, command line, and live connection status. Status comes from the `system/init` event — the only honest source — so servers show a grey dot until a turn has actually run
+- **Concurrent sessions** — up to 3 sessions run at once (configurable). A new session takes the slot of the longest-idle process; if all are busy, it waits for one instead of killing someone else's turn
 - **Message queue** — messages sent mid-generation aren't dropped or interleaved; they queue and fire when the current turn ends
 - **Session search** — full-text search over titles and bodies, click a hit to jump
 - **Markdown rendering** — headings, lists, code blocks, tables, quotes, links
@@ -287,9 +290,10 @@ Raw events are translated into UI deltas:
 | Daemon precision | launchd polls every 60 s, so actual fire time can be up to a minute off |
 | No catch-up | Tasks missed by more than 6 hours are skipped and marked `skipped` |
 | Daemon is macOS-only | Built on launchd; no equivalent for Windows/Linux |
-| Task concurrency | Simultaneously due tasks each spawn their own `claude`; there's no global cap |
 | Notifications | Results stay in-app; no system notifications |
-| Artifact detection | Only `Write`/`Edit`-style `file_path` values count; files created via `Bash` redirection don't appear |
+| Artifact detection is best-effort | The snapshot walk stops at 8000 files / 5 levels / 400 ms to keep sending responsive. Big repos get a partial scan, and if both scans truncate the diff is skipped rather than reported wrong |
+| Context limit is inferred | There's no API to ask a model its window size, so it's guessed from the model name (1M for Qwen 3.6+, 128k for DeepSeek, 200k otherwise). Override with `contextLimit` in the config |
+| MCP panel is read-only | It reads `~/.claude.json` and `.mcp.json`, never writes. Add servers with `claude mcp add` |
 | Queue is volatile | Pending messages live in memory and vanish on session switch or quit |
 | Private runtime is app-only | The runtime the app installs isn't on `PATH`; `claude` in a terminal won't see it. Install a global copy if you need one — the app prefers its own |
 
@@ -298,9 +302,12 @@ Raw events are translated into UI deltas:
 ## Roadmap
 
 - [ ] System notifications (task finished / failed)
-- [ ] Global task concurrency cap
-- [ ] Packaged release artifacts + CI
+- [ ] Export a session as Markdown / JSON
+- [ ] `@`-reference files already in the working directory (today the only way is to attach a copy)
 - [ ] Windows / Linux support
+- [x] Packaged release artifacts + CI
+- [x] Global concurrency cap
+- [x] MCP status panel
 
 ---
 
@@ -313,6 +320,7 @@ claude-buddy/
 ├── lib/
 │   ├── schedule.js             Next-run computation / due & stale checks
 │   ├── claude-bin.js           Locate claude, patch PATH, probe login shell
+│   ├── artifacts.js            Filesystem snapshot + diff (artifact detection)
 │   └── launchd.js              LaunchAgent install / uninstall / status
 ├── preload.js                  contextBridge allowlist
 ├── renderer/
@@ -320,13 +328,17 @@ claude-buddy/
 │   ├── style.css               Dark theme
 │   ├── app.js                  Markdown, streaming, tool cards, sessions & tasks
 │   └── installer.html          Claude Code install wizard
+├── test/                       node:test suites (schedule, artifact diff)
+├── tools/
+│   ├── make-icon.py            Draws assets/icon.png + .icns from code
+│   └── cdp.js                  Drive a running build over DevTools Protocol
 ├── start-claude-buddy.command  Double-click launcher (handles env vars)
 ├── assets/                     Screenshots
 ├── .claude-runtime/            App-private claude (generated, gitignored)
 └── package.json
 ```
 
-The two things that must never drift between the app and the background runner are extracted into `lib/` and shared by both: `schedule.js` (`computeNext`, `dueState`) and `claude-bin.js` (`resolve`, `childEnv`, `probeViaShell`). Task data lives alongside sessions in `sessions.json` under `tasks[]`.
+The things that must never drift between the app and the background runner are extracted into `lib/` and shared by both: `schedule.js` (`computeNext`, `dueState`), `claude-bin.js` (`resolve`, `childEnv`, `probeViaShell`), and `artifacts.js`. Task data lives alongside sessions in `sessions.json` under `tasks[]`.
 
 Session data: `~/Library/Application Support/Claude Buddy/sessions.json`.
 

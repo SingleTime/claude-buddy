@@ -119,6 +119,9 @@
           <button class="panel-tab" data-ptab="artifacts">
             产物<span class="tab-count" id="artifactCount" hidden>0</span>
           </button>
+          <button class="panel-tab" data-ptab="mcp">
+            MCP<span class="tab-count" id="mcpCount" hidden>0</span>
+          </button>
         </div>
 
         <div data-pane="status">
@@ -144,6 +147,19 @@
           </div>
 
           <div class="panel-section">
+            <div class="panel-label">
+              上下文 <span id="ctxPct" class="muted">—</span>
+            </div>
+            <div class="ctx-bar" id="ctxBar" title="这一轮实际喂进模型的 token 数（输入 + 缓存命中 + 缓存写入）">
+              <i id="ctxFill"></i>
+            </div>
+            <div class="ctx-meta">
+              <span id="ctxText">还没跑过</span>
+              <button class="ctx-btn" id="compactBtn" title="让 claude 压缩历史，腾出窗口">压缩</button>
+            </div>
+          </div>
+
+          <div class="panel-section">
             <div class="panel-label">本会话</div>
             <div class="stat-row"><span>轮次成本</span><b id="statCost">$0.0000</b></div>
             <div class="stat-row"><span>累计成本</span><b id="statTotalCost">$0.0000</b></div>
@@ -161,6 +177,7 @@
           <div class="panel-section">
             <div class="panel-label">运行状态</div>
             <div class="stat-row"><span>进程</span><b id="statProc">未启动</b></div>
+            <div class="stat-row"><span>并发</span><b id="statConc">—</b></div>
             <div class="stat-row"><span>会话 ID</span><b id="statSid" class="mono">—</b></div>
           </div>
         </div>
@@ -168,6 +185,19 @@
         <div data-pane="artifacts" hidden>
           <div class="artifact-empty" id="artifactEmpty">这个会话还没产出文件</div>
           <div class="artifact-list" id="artifactList"></div>
+        </div>
+
+        <div data-pane="mcp" hidden>
+          <div class="mcp-head">
+            <span class="muted" id="mcpCwd">—</span>
+            <button class="ctx-btn" id="mcpRefresh">重扫</button>
+          </div>
+          <div class="artifact-empty" id="mcpEmpty">
+            这个目录下没有 MCP server。<br />
+            在终端执行 <code>claude mcp add &lt;name&gt; -- &lt;command&gt;</code> 后点重扫。
+          </div>
+          <div class="mcp-list" id="mcpList"></div>
+          <div class="mcp-foot" id="mcpFoot"></div>
         </div>
       </aside>
     </div>

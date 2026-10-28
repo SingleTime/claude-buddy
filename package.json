@@ -1,6 +1,6 @@
 {
   "name": "claude-buddy",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "A macOS desktop AI agent that uses the Claude Code CLI as its runtime",
   "main": "main.js",
   "type": "commonjs",

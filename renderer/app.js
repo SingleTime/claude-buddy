@@ -37,6 +37,13 @@ const els = {
   taskCount: $("taskCount"),
   newTask: $("newTask"),
   taskModal: $("taskModal"),
+  // 后台守护
+  bgBar: $("bgBar"),
+  bgDot: $("bgDot"),
+  bgTitle: $("bgTitle"),
+  bgSub: $("bgSub"),
+  bgBtn: $("bgBtn"),
+  bgLog: $("bgLog"),
   // 附件 / 队列
   attachBar: $("attachBar"),
   attachBtn: $("attachBtn"),
@@ -72,6 +79,7 @@ const state = {
   queue: [], // 忙碌时排队的消息
   artifacts: new Map(), // 本会话产出的文件 path -> meta
   searchHits: null, // 非 null 表示正在展示搜索结果
+  bg: null, // 后台守护状态（launchd）
 };
 
 /* ------------------------------------------------------------------ */
@@ -418,6 +426,11 @@ function scheduleTextRender() {
 }
 
 function onEvent(evt) {
+  // 后台执行器刚跑完、把调度权交回来：内存里的任务/会话可能已经是旧的了
+  if (evt.type === "reload") {
+    reloadFromDisk();
+    return;
+  }
   // 任务类事件跟当前会话无关，先处理掉
   if (evt.type === "tasks") {
     state.tasks = evt.tasks || [];
@@ -1223,6 +1236,75 @@ function scheduleLabel(t) {
   return `每天 ${s.time}`;
 }
 
+/* ------------------------------------------------------------------ */
+/* 后台守护                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 状态条只讲一件事：应用关掉之后，这些任务还会不会跑。
+ * 这是唯一需要用户理解的信息，其余（plist 路径、launchctl 状态）都塞进 title。
+ */
+function renderBg() {
+  const bg = state.bg;
+  if (!bg) {
+    els.bgBar.hidden = true;
+    return;
+  }
+  els.bgBar.hidden = false;
+
+  const on = !!(bg.installed && bg.loaded);
+  els.bgBar.classList.toggle("on", on);
+  els.bgBar.classList.toggle("warn", !on);
+
+  if (!bg.supported) {
+    els.bgTitle.textContent = "后台守护";
+    els.bgSub.textContent = "仅 macOS 支持，Windows / Linux 暂未适配";
+    els.bgBtn.hidden = true;
+    els.bgLog.hidden = true;
+    return;
+  }
+
+  els.bgBtn.hidden = false;
+  els.bgLog.hidden = !on;
+  els.bgBtn.textContent = on ? "关闭" : "开启";
+  els.bgTitle.textContent = "后台守护";
+
+  if (bg.error) {
+    els.bgSub.textContent = String(bg.error).slice(0, 90);
+  } else if (on) {
+    els.bgSub.textContent =
+      bg.enabledTasks > 0 ? `已开启 · 关掉应用也会跑` : "已开启 · 暂无启用的任务";
+  } else if (bg.installed) {
+    els.bgSub.textContent = "未生效 · 点「开启」修复";
+  } else {
+    els.bgSub.textContent =
+      bg.enabledTasks > 0 ? "未开启 · 关掉应用就停" : "未开启 · 启用任务时自动装";
+  }
+
+  els.bgBar.title = [
+    bg.plistPath ? `plist: ${bg.plistPath}` : "",
+    bg.logPath ? `日志: ${bg.logPath}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function toggleBg() {
+  const bg = state.bg;
+  if (!bg || !bg.supported) return;
+  const on = !!(bg.installed && bg.loaded);
+
+  els.bgBtn.disabled = true;
+  els.bgBtn.textContent = on ? "关闭中…" : "开启中…";
+  const r = on ? await buddy.bgDisable() : await buddy.bgEnable();
+  els.bgBtn.disabled = false;
+
+  if (r) {
+    state.bg = r;
+    renderBg();
+  }
+}
+
 function renderTaskList() {
   els.taskList.innerHTML = "";
   const tasks = state.tasks || [];
@@ -1260,7 +1342,9 @@ function renderTaskList() {
       const r = await buddy.toggleTask(t.id, !t.enabled);
       if (r && r.ok) {
         state.tasks = state.tasks.map((x) => (x.id === t.id ? r.task : x));
+        if (r.bg) state.bg = r.bg;
         renderTaskList();
+        renderBg();
       }
     });
     top.appendChild(sw);
@@ -1369,7 +1453,9 @@ function switchTab(name) {
 async function refreshTasks() {
   try {
     state.tasks = await buddy.listTasks();
+    state.bg = await buddy.bgStatus();
     renderTaskList();
+    renderBg();
   } catch (e) {
     console.error("拉取任务失败", e);
   }
@@ -1525,13 +1611,41 @@ function shortPath(p) {
   return p.replace(home, "~");
 }
 
+/**
+ * 从磁盘重读一遍数据。
+ *
+ * 只在「启动时后台执行器正持锁」这一种情况下被调用：它跑完放手，我们才接管，
+ * 这期间它可能写入了新的任务结果。这时用户刚打开应用、还没开始操作，
+ * 重读是安全的；正在生成中就跳过，等下轮刷新。
+ */
+async function reloadFromDisk() {
+  if (state.busy) return;
+  try {
+    const init = await buddy.init();
+    state.config = init.config;
+    state.sessions = init.sessions;
+    state.tasks = init.tasks || [];
+    state.bg = init.bg || null;
+    renderSessionList();
+    renderTaskList();
+    renderBg();
+    if (init.activeId && init.activeId !== state.activeId) {
+      await openSession(init.activeId);
+    }
+  } catch (e) {
+    console.error("重新载入失败", e);
+  }
+}
+
 async function bootstrap() {
   const init = await buddy.init();
   state.config = init.config;
   state.sessions = init.sessions;
   state.activeId = init.activeId;
   state.tasks = init.tasks || [];
+  state.bg = init.bg || null;
   renderTaskList();
+  renderBg();
 
   els.cwdLabel.textContent = shortPath(init.config.cwd || "~");
   els.cwdLabel.title = init.config.cwd;
@@ -1566,6 +1680,8 @@ async function bootstrap() {
   });
 
   els.newChat.addEventListener("click", newSession);
+  els.bgBtn.addEventListener("click", toggleBg);
+  els.bgLog.addEventListener("click", () => buddy.bgOpenLog());
 
   els.cwdBtn.addEventListener("click", async () => {
     const dir = await buddy.pickDir();

@@ -34,6 +34,13 @@ contextBridge.exposeInMainWorld("buddy", {
   runTask: (id) => ipcRenderer.invoke("task:run", id),
   stopTask: (id) => ipcRenderer.invoke("task:stop", id),
 
+  // 后台守护：应用关掉之后靠 launchd 继续跑任务
+  bgStatus: () => ipcRenderer.invoke("bg:status"),
+  bgEnable: () => ipcRenderer.invoke("bg:enable"),
+  bgDisable: () => ipcRenderer.invoke("bg:disable"),
+  bgOpenLog: () => ipcRenderer.invoke("bg:openLog"),
+  bgDoctor: () => ipcRenderer.invoke("bg:doctor"),
+
   updateConfig: (patch) => ipcRenderer.invoke("config:update", patch),
   pickDir: () => ipcRenderer.invoke("dialog:pickDir"),
   openPath: (p) => ipcRenderer.invoke("shell:openPath", p),

@@ -14,6 +14,10 @@ const os = require("node:os");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 
+const claudeBin = require("./lib/claude-bin");
+const { computeNext, TASK_TIMEOUT_MS } = require("./lib/schedule");
+const launchd = require("./lib/launchd");
+
 app.setName("Claude Buddy");
 
 /* ------------------------------------------------------------------ */
@@ -48,28 +52,8 @@ function runtimeDir() {
   }
 }
 
-/**
- * 私有运行时里的 claude。
- *
- * postinstall 没跑（--ignore-scripts、--omit=optional）时，`.bin/claude` 指向的
- * 只是一个 500 字节的提示脚本；它虽然可执行，跑起来只会打印错误然后退出 1。
- * 所以不能只看存在与否 —— 真实的原生二进制有 260MB 以上，用体积区分。
- */
-function runtimeClaudeBin() {
-  const link = path.join(runtimeDir(), "node_modules", ".bin", "claude");
-  try {
-    const real = fs.realpathSync(link);
-    if (fs.statSync(real).size > 1024 * 1024) return link;
-  } catch {
-    /* 没装过 */
-  }
-  return null;
-}
-
-/** 单引号包裹，供只拼自家路径的 shell 命令使用 */
-function shellQuote(s) {
-  return `'${String(s).replace(/'/g, `'\\''`)}'`;
-}
+/** 单引号包裹，供只拼自家路径的 shell 命令使用（安装流程用） */
+const shellQuote = claudeBin.shellQuote;
 
 /**
  * 定位 claude 可执行文件。
@@ -77,76 +61,19 @@ function shellQuote(s) {
  * 不能只靠 PATH：从 Finder / Dock 启动的 GUI 应用拿不到 shell 的 PATH
  * （通常只有 /usr/bin:/bin:/usr/sbin:/sbin），homebrew 装的 claude 会找不到。
  * 所以先探常见安装位置，再退回 PATH，最后交给 spawn 自己解析。
+ *
+ * 真正的查找逻辑在 lib/claude-bin.js —— 后台执行器要用同一份，
+ * 两边各写一套必然漂移成「应用里能跑、后台说不装」。
  */
-function claudeCandidates() {
-  const home = os.homedir();
-  const list = [
-    "/opt/homebrew/bin/claude", // Apple Silicon + Homebrew
-    "/usr/local/bin/claude", // Intel + Homebrew
-    path.join(home, ".claude/local/claude"), // claude 自带本地安装
-    path.join(home, ".local/bin/claude"), // 官方安装脚本的默认位置
-    path.join(home, ".bun/bin/claude"),
-    path.join(home, ".npm-global/bin/claude"),
-    path.join(home, ".volta/bin/claude"),
-  ];
-  // nvm / fnm 装的 node，全局 bin 在版本目录里，静态列表够不着
-  for (const root of [".nvm/versions/node", ".fnm/node-versions"]) {
-    try {
-      for (const v of fs.readdirSync(path.join(home, root))) {
-        list.push(path.join(home, root, v, "bin", "claude"));
-        list.push(path.join(home, root, v, "installation", "bin", "claude")); // fnm 的目录结构
-      }
-    } catch {
-      /* 没装这个版本管理器 */
-    }
-  }
-  return list;
-}
-
 function resolveClaudeBin() {
-  // 显式指定优先，但路径失效时要退回去自动探测：
-  // 否则「CLAUDE_BIN 指错了 → 装完新的也永远用旧的」这种死局解不开
-  const explicit = process.env.CLAUDE_BIN;
-  if (explicit) {
-    try {
-      if (fs.existsSync(explicit)) return explicit;
-    } catch {
-      /* 无效路径，继续探测 */
-    }
-  }
-
-  // 应用自己装的那份优先：它跟着 app 走，版本可预期，也不用猜用户的 PATH
-  const own = runtimeClaudeBin();
-  if (own) return own;
-
-  for (const p of claudeCandidates()) {
-    try {
-      if (fs.existsSync(p)) return p;
-    } catch {
-      /* 忽略无权限目录 */
-    }
-  }
-
-  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
-    if (!dir) continue;
-    try {
-      if (fs.statSync(path.join(dir, "claude")).isFile()) return path.join(dir, "claude");
-    } catch {
-      /* 找不到就下一个 */
-    }
-  }
-  return "claude";
+  return claudeBin.resolve({ runtimeDir: runtimeDir() });
 }
 
 let CLAUDE_BIN = resolveClaudeBin();
 
 /** 是否真的定位到了可执行文件（裸名 "claude" 视为未找到） */
 function claudeReady() {
-  try {
-    return CLAUDE_BIN.includes(path.sep) && fs.existsSync(CLAUDE_BIN);
-  } catch {
-    return false;
-  }
+  return claudeBin.ready(CLAUDE_BIN);
 }
 
 /** 安装完成后重新扫描，返回找到的路径或 null */
@@ -166,74 +93,9 @@ function rescanClaudeBin() {
  * 所以让登录 shell 自己报出来（它会加载 .zshrc / .bash_profile 里的 PATH）。
  * 只有真的问不到，才认为「本机没有」。
  */
-function probeViaShell(name) {
-  return new Promise((resolve) => {
-    const shell = process.env.SHELL || safeUserShell() || "/bin/bash";
-    let settled = false;
-    const finish = (v) => {
-      if (!settled) {
-        settled = true;
-        resolve(v);
-      }
-    };
-
-    let proc;
-    try {
-      proc = spawn(shell, ["-lc", `command -v ${name}`], {
-        env: childEnv(),
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-    } catch {
-      return finish(null);
-    }
-
-    // 某些人的 rc 文件里挂着网络请求或慢操作，不能无限等
-    const timer = setTimeout(() => {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        /* 已经退出 */
-      }
-      finish(null);
-    }, 8000);
-
-    let out = "";
-    proc.stdout.setEncoding("utf8");
-    proc.stdout.on("data", (c) => {
-      out += c;
-    });
-    proc.on("error", () => {
-      clearTimeout(timer);
-      finish(null);
-    });
-    proc.on("close", () => {
-      clearTimeout(timer);
-      // command -v 可能返回别名或函数定义，只要绝对路径那一行
-      const found = out
-        .split("\n")
-        .map((s) => s.trim())
-        .find((s) => s.startsWith("/") && !s.includes(" "));
-      if (!found) return finish(null);
-      try {
-        if (fs.statSync(found).isFile()) return finish(found);
-      } catch {
-        /* 报了个不存在的路径 */
-      }
-      finish(null);
-    });
-  });
-}
+const probeViaShell = claudeBin.probeViaShell;
 
 const probeClaudeViaShell = () => probeViaShell("claude");
-
-function safeUserShell() {
-  try {
-    const s = os.userInfo().shell;
-    return s && fs.existsSync(s) ? s : "";
-  } catch {
-    return "";
-  }
-}
 
 /**
  * 确认 claude 是否可用：先看已解析的路径，再问一次登录 shell。
@@ -265,22 +127,7 @@ async function pickInstallMethod() {
 }
 
 /** 给子进程补齐 PATH，保证 claude 内部调用 node / git / 其它 CLI 也能命中 */
-function childEnv() {
-  const extra = [
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-    path.join(os.homedir(), ".local/bin"),
-  ];
-  const current = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
-  const merged = [...current];
-  for (const p of extra) if (!merged.includes(p)) merged.push(p);
-  return { ...process.env, PATH: merged.join(path.delimiter) };
-}
+const childEnv = claudeBin.childEnv;
 
 const PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions"];
 
@@ -317,16 +164,44 @@ function loadStore() {
 }
 
 let saveTimer = null;
+let storeDirty = false;
+
+/**
+ * 原子写：先写临时文件再 rename。
+ *
+ * 原来直接 writeFileSync，写到一半被杀（强制退出、断电、磁盘满）就留一个
+ * 半截 JSON，下次启动 loadStore 解析失败 → 退回空存储 → 用户所有会话看起来
+ * 都消失了。rename 在同一文件系统内是原子的，要么旧的要么新的。
+ */
+function writeStoreNow() {
+  if (!storePath) return;
+  try {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    const tmp = `${storePath}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(store, null, 2), "utf8");
+    fs.renameSync(tmp, storePath);
+    storeDirty = false;
+  } catch (e) {
+    console.error("[store] 写入失败:", e.message);
+  }
+}
+
 function saveStore() {
+  storeDirty = true;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try {
-      fs.mkdirSync(path.dirname(storePath), { recursive: true });
-      fs.writeFileSync(storePath, JSON.stringify(store, null, 2), "utf8");
-    } catch (e) {
-      console.error("[store] 写入失败:", e.message);
-    }
-  }, 300);
+  saveTimer = setTimeout(writeStoreNow, 300);
+}
+
+/**
+ * 把 debounce 里还没落盘的那次写立刻写掉。
+ *
+ * 退出时要调：不然「刚改完任务就 ⌘Q」会丢掉最后一次改动 —— 后台执行器
+ * 读到的还是旧 nextRunAt，表现就是「明明设了任务却不跑」。
+ */
+function flushStore() {
+  if (!storeDirty) return;
+  clearTimeout(saveTimer);
+  writeStoreNow();
 }
 
 const newId = () => crypto.randomUUID();
@@ -781,7 +656,6 @@ const pendingTaskRuns = new Map();
 /** taskId -> true，防重入 */
 const runningTasks = new Set();
 
-const TASK_TIMEOUT_MS = 15 * 60 * 1000; // 单次运行最长 15 分钟
 const MAX_RUNS_KEPT = 20;
 
 function getTask(id) {
@@ -807,39 +681,11 @@ function normalizeTask(input, existing) {
   return t;
 }
 
-/** 按当前时间推算下一次运行时间戳 */
-function computeNext(task, from) {
-  const s = task.schedule || {};
-  const base = new Date(from);
-
-  if (s.type === "interval") {
-    const mins = Math.max(1, Number(s.everyMinutes) || 120);
-    // 抹掉秒再相加：保持严格 N 分钟间隔，又不会因为余数累积漂移
-    return Math.floor(from / 60000) * 60000 + mins * 60000;
-  }
-
-  const [hh, mm] = String(s.time || "09:00")
-    .split(":")
-    .map((x) => parseInt(x, 10) || 0);
-
-  if (s.type === "weekly") {
-    const days = (s.days || []).filter((d) => d >= 0 && d <= 6);
-    const list = days.length ? days : [1];
-    for (let i = 0; i <= 7; i++) {
-      const d = new Date(base);
-      d.setDate(d.getDate() + i);
-      d.setHours(hh, mm, 0, 0);
-      if (list.includes(d.getDay()) && d.getTime() > from) return d.getTime();
-    }
-    return from + 7 * 86400000;
-  }
-
-  // daily（默认）
-  const d = new Date(base);
-  d.setHours(hh, mm, 0, 0);
-  if (d.getTime() <= from) d.setDate(d.getDate() + 1);
-  return d.getTime();
-}
+/**
+ * 按当前时间推算下一次运行时间戳。
+ * 实现放在 lib/schedule.js —— 后台执行器要用同一份，否则「应用里 9:05 跑、
+ * 后台 9:07 跑」这种偏差查起来极费劲。
+ */
 
 function taskView(t) {
   return {
@@ -1015,6 +861,181 @@ function finishTaskRun(sessionId, outcome) {
     cost: outcome.cost || 0,
   });
   emitTasks();
+}
+
+/* ------------------------------------------------------------------ */
+/* 调度锁：应用与后台执行器互斥                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 同一时刻只允许一个调度者在写 sessions.json。
+ *
+ * 应用开着 → 应用调度（进程内定时器，10 秒精度）
+ * 应用关着 → launchd 每分钟拉起 runner.js 调度
+ *
+ * 两边都在的时候必然出问题：同一任务跑两遍、后写的把先写的整个 store 覆盖掉。
+ * 所以用磁盘上的锁做仲裁，谁的 pid 活着谁说话。
+ */
+const lockFilePath = () => path.join(app.getPath("userData"), "scheduler.lock");
+
+function pidAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+function readLockFile() {
+  try {
+    return JSON.parse(fs.readFileSync(lockFilePath(), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function acquireSchedulerLock() {
+  for (let i = 0; i < 3; i++) {
+    try {
+      fs.mkdirSync(path.dirname(lockFilePath()), { recursive: true });
+      fs.writeFileSync(
+        lockFilePath(),
+        JSON.stringify({ pid: process.pid, kind: "app", at: Date.now() }),
+        { flag: "wx" },
+      );
+      return true;
+    } catch (e) {
+      if (e.code !== "EEXIST") return false;
+      const cur = readLockFile();
+      if (cur && pidAlive(cur.pid)) return false;
+      // 陈旧锁（上次崩溃留下的）自动清掉，否则后台永远起不来
+      try {
+        fs.unlinkSync(lockFilePath());
+      } catch {
+        /* 别人先删了 */
+      }
+    }
+  }
+  return false;
+}
+
+function releaseSchedulerLock() {
+  const cur = readLockFile();
+  if (cur && cur.pid === process.pid) {
+    try {
+      fs.unlinkSync(lockFilePath());
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 后台守护（launchd）                                                 */
+/* ------------------------------------------------------------------ */
+
+function runnerPath() {
+  // 打包后 runner.js 由 extraResources 放到 Resources/ 下（asar 里 launchd 不好读）
+  const packed = process.resourcesPath ? path.join(process.resourcesPath, "runner.js") : "";
+  if (packed && fs.existsSync(packed)) return packed;
+  return path.join(__dirname, "runner.js");
+}
+
+function runnerLogPath() {
+  return path.join(app.getPath("userData"), "logs", "runner.log");
+}
+
+/** Electron 未签名二进制在 launchd 下的噪音单独存，别埋掉真错误 */
+function runnerErrPath() {
+  return path.join(app.getPath("userData"), "logs", "runner.err");
+}
+
+function bgArgs() {
+  return {
+    execPath: process.execPath,
+    runnerPath: runnerPath(),
+    logPath: runnerLogPath(),
+    errPath: runnerErrPath(),
+  };
+}
+
+function bgInfo() {
+  const st = launchd.status();
+  const lk = readLockFile();
+  return {
+    supported: process.platform === "darwin",
+    installed: st.installed,
+    loaded: st.loaded,
+    label: st.label,
+    plistPath: st.plistPath,
+    // 用户主动关过就别再自动开
+    optedOut: store.config.backgroundRunner === false,
+    enabledTasks: store.tasks.filter((t) => t.enabled).length,
+    running: !!lk && lk.kind === "headless" && pidAlive(lk.pid),
+    logPath: runnerLogPath(),
+    error: launchd.lastErrorText() || null,
+  };
+}
+
+/**
+ * 确保后台守护已装。
+ *
+ * 触发条件：有启用的任务 + 用户没主动关过。装失败不阻塞任何 UI 操作，
+ * 只把错误留在 bgInfo 里给界面显示 —— 任务在应用开着时照样能跑。
+ */
+function ensureBackground({ force = false } = {}) {
+  if (process.platform !== "darwin") return { ok: false, error: "仅 macOS 支持后台守护" };
+  if (store.config.backgroundRunner === false && !force) return { ok: false, skipped: "用户已关闭" };
+  if (!store.tasks.some((t) => t.enabled)) return { ok: false, skipped: "没有启用的任务" };
+
+  const args = bgArgs();
+  const st = launchd.status();
+  if (st.installed && !launchd.needsRewrite(args) && !force) {
+    // 已装且路径没变：只补一次加载（重启后 plist 还在但可能没被 bootstrap）
+    if (!st.loaded) launchd.install(args);
+    return { ok: true, ...bgInfo() };
+  }
+
+  const r = launchd.install(args);
+  if (!r.ok) {
+    console.error("[bg] 安装后台守护失败:", r.error);
+    return { ok: false, error: r.error, ...bgInfo() };
+  }
+  return { ok: true, ...bgInfo() };
+}
+
+/**
+ * 启动调度。
+ *
+ * 拿不到锁说明后台执行器正在跑任务（用户打开应用时恰好有任务在跑）。
+ * 这时不要抢：抢了会两边同时写盘。等它把锁放掉再接管，接管前重载一次磁盘，
+ * 把后台刚写进去的任务结果拿进内存。
+ */
+let bgHandoffTimer = null;
+let schedulerOn = false;
+
+function startSchedulerGuarded() {
+  if (acquireSchedulerLock()) {
+    schedulerOn = true;
+    startScheduler();
+    return;
+  }
+
+  if (bgHandoffTimer) return;
+  bgHandoffTimer = setInterval(() => {
+    if (!acquireSchedulerLock()) return;
+    clearInterval(bgHandoffTimer);
+    bgHandoffTimer = null;
+    schedulerOn = true;
+    // 后台刚写过盘，重载后再调度，否则会用旧的任务列表覆盖它
+    loadStore();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("evt", { type: "reload" });
+    }
+    startScheduler();
+  }, 3000);
 }
 
 /** 每分钟检查一次，到点就跑 */
@@ -1628,6 +1649,7 @@ app.whenReady().then(() => {
     permissionModes: PERMISSION_MODES,
     platform: process.platform,
     claudeBin: CLAUDE_BIN,
+    bg: bgInfo(),
   }));
 
   /* ---------------- 定时任务 ---------------- */
@@ -1643,7 +1665,9 @@ app.whenReady().then(() => {
     if (!existing) store.tasks.push(t);
     saveStore();
     emitTasks();
-    return { ok: true, task: taskView(t) };
+    // 有启用的任务就该让它在应用关着的时候也能跑
+    if (t.enabled) ensureBackground();
+    return { ok: true, task: taskView(t), bg: bgInfo() };
   });
 
   ipcMain.handle("task:delete", (_e, id) => {
@@ -1674,7 +1698,8 @@ app.whenReady().then(() => {
     if (t.enabled) t.nextRunAt = computeNext(t, Date.now());
     saveStore();
     emitTasks();
-    return { ok: true, task: taskView(t) };
+    if (t.enabled) ensureBackground();
+    return { ok: true, task: taskView(t), bg: bgInfo() };
   });
 
   ipcMain.handle("task:run", async (_e, id) => {
@@ -1691,6 +1716,64 @@ app.whenReady().then(() => {
       finishTaskRun(t.sessionId, { ok: false, error: "已手动停止" });
     }
     return { ok: true };
+  });
+
+  /* ---------------- 后台守护 ---------------- */
+
+  ipcMain.handle("bg:status", () => bgInfo());
+
+  ipcMain.handle("bg:enable", () => {
+    store.config.backgroundRunner = true;
+    saveStore();
+    flushStore();
+    const r = ensureBackground({ force: true });
+    return { ...bgInfo(), ok: !!r.ok, error: r.error || null };
+  });
+
+  ipcMain.handle("bg:disable", () => {
+    store.config.backgroundRunner = false;
+    saveStore();
+    flushStore();
+    const r = launchd.uninstall();
+    return { ...bgInfo(), ok: !!r.ok, error: r.error || null };
+  });
+
+  ipcMain.handle("bg:openLog", () => {
+    const p = runnerLogPath();
+    try {
+      if (!fs.existsSync(p)) fs.mkdirSync(path.dirname(p), { recursive: true }), fs.writeFileSync(p, "");
+    } catch {
+      /* 打不开就算了 */
+    }
+    return shell.openPath(p);
+  });
+
+  /**
+   * 排障：用 --doctor 跑一次执行器，把它看到的世界原样返回。
+   * 不拿锁、不执行任务，所以应用开着也能跑。
+   */
+  ipcMain.handle("bg:doctor", () => {
+    return new Promise((resolve) => {
+      const a = bgArgs();
+      let out = "";
+      let proc;
+      try {
+        proc = spawn(a.execPath, [a.runnerPath, "--doctor"], {
+          env: {
+            ...process.env,
+            ELECTRON_RUN_AS_NODE: "1",
+            CLAUDE_BUDDY_USER_DATA: app.getPath("userData"),
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (e) {
+        return resolve({ code: -1, out: String(e.message) });
+      }
+      proc.stdout.on("data", (c) => (out += c));
+      proc.stderr.on("data", (c) => (out += c));
+      proc.on("close", (code) => resolve({ code, out: out.slice(0, 6000) }));
+      proc.on("error", (e) => resolve({ code: -1, out: String(e.message) }));
+    });
   });
 
   ipcMain.handle("session:new", (_e, cwd) => {
@@ -1870,8 +1953,12 @@ app.whenReady().then(() => {
   ipcMain.handle("install:recheck", () => ({ bin: rescanClaudeBin() }));
 
   createWindow();
-  startScheduler();
+  // 拿锁再调度：拿不到说明后台执行器正在跑任务，等它放手再接管
+  startSchedulerGuarded();
   warnIfClaudeMissing();
+
+  // 装/修后台守护要走 launchctl（同步子进程），放到首屏之后，别挡开窗
+  setTimeout(() => ensureBackground(), 1500);
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -1885,6 +1972,11 @@ app.on("window-all-closed", () => {
 
 app.on("before-quit", () => {
   clearInterval(tickTimer);
+  if (bgHandoffTimer) clearInterval(bgHandoffTimer);
   for (const pend of pendingTaskRuns.values()) if (pend.timer) clearTimeout(pend.timer);
   killAllRunners();
+  // debounce 里那一次写要落盘，否则刚改的任务后台读不到
+  flushStore();
+  // 让出调度权，launchd 那侧才会接手
+  releaseSchedulerLock();
 });

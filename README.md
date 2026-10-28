@@ -64,6 +64,7 @@ claude -p --input-format stream-json --output-format stream-json \
 - **成本面板** — 本轮成本、累计成本、输入输出 token、缓存命中、耗时
 - **工具清单** — 右栏列出当前会话可用工具（含 MCP）
 - **定时任务** — 按天 / 按周 / 按间隔自动跑，结果落进独立会话
+- **后台守护** — 装一个 LaunchAgent，应用关掉（甚至没启动）也按时跑任务；没有常驻进程，到点才唤起、跑完就退
 - **缺依赖自动兜底** — 找不到 `claude` 时先查登录 shell，确认没有再引导安装；装进应用私有目录，不碰系统
 
 ---
@@ -285,6 +286,32 @@ $ claude -p "查 03690" --permission-mode acceptEdits --allowedTools "mcp__finan
 
 **建好之后先点一次「立即运行」**，确认输出确实是你想要的那个东西，再启用。定时任务无人值守，跑歪了不会有人当场发现。
 
+### 应用关掉也在跑
+
+任务面板顶部有个「后台守护」状态条。装好之后，应用**完全没启动**任务也会按时执行。
+
+原理很朴素：`~/Library/LaunchAgents/com.claudebuddy.tasks.plist` 让 launchd 每 60 秒拉起一次 `runner.js`，它读到点的任务才干活，没有就立刻退出（实测空转约 0.3 秒 / 次）。不是常驻 daemon —— 常驻进程要和应用抢同一份 `sessions.json`，两边同时写必然丢数据。
+
+只有一个调度者是关键，用磁盘锁仲裁：
+
+| 谁在跑 | 谁调度 |
+|---|---|
+| 应用开着 | 应用内定时器（10 秒精度），后台执行器拿不到锁直接退出 |
+| 应用没开 | launchd 起的 `runner.js`（60 秒精度） |
+| 应用启动时恰好后台在跑 | 应用先不调度，等它放手 → 重载磁盘 → 接管 |
+
+锁文件是 `scheduler.lock`，记 pid。应用崩溃或 `kill -9` 之后锁会残留，但执行器会检查 pid 是否还活着，死者留下的锁自动清掉 —— 实测强杀应用后，下一个 60 秒周期照常接管并跑完任务。
+
+想自己看一眼执行器的视角：
+
+```bash
+npm run doctor
+```
+
+会打印它读的目录、找到的 claude、当前锁的归属、每个任务的下次时间。日志在 `~/Library/Application Support/Claude Buddy/logs/runner.log`，状态条右侧的「日志」按钮直接打开。`runner.err` 单独存 —— 里面基本只有 Electron 未签名二进制在 launchd 下的一条无害告警。
+
+不想要就点状态条上的「关闭」，plist 和 launchd 任务一起删掉，不留残留。
+
 ---
 
 ## 踩过的坑
@@ -359,6 +386,18 @@ npm 的 postinstall 只把二进制硬链接到 **npm 自己的 prefix**，不�
 
 `config:update` 会杀掉旧 runner 重起。旧进程的 `exit` 事件是异步的，如果这时候用户已经发了下一条，`proc_exit` 处理器会把新一轮的 `busy` 重置成 false、还会 `runners.delete(session.id)` 把**新**进程从表里删掉 —— 之后写进 stdin 的消息全部落空，界面留一个空气泡。修法：退出时先比对 `runners.get(id).proc === proc`，不是自己就不动表；事件里带上 `current` 标志，渲染层忽略旧进程的 `proc_exit`。
 
+**16. headless 里等 `close` 会永远等下去**
+
+后台执行器第一版照着常驻会话的写法：`spawn` 完写一行 user message，然后等 `proc.on("close")` 收口。结果任务状态卡在 `running` 直到 15 分钟超时 —— 因为 stdin 一直开着（常驻会话本来就要一直开着），claude 输出完 `result` 之后**不会退出**，它还在等下一条消息。
+
+修法：`result` 是这一轮最后一个事件，收到就地收口，然后 `stdin.end()` 发 EOF 让它自己退，3 秒不退再 `SIGTERM`。判断「这轮结束了」不能靠进程退出码。
+
+**17. 两个调度者同时写 `sessions.json`**
+
+launchd 每 60 秒拉起执行器，而应用自己也有定时器。如果不管，应用开着的时候执行器照样跑，同一次任务可能跑两遍，而且两边各自把整份 store 序列化写回去 —— 后写的把先写的覆盖掉。
+
+修法：磁盘锁 `scheduler.lock`（`wx` 原子创建 + pid 存活判定），同一时刻只有一个调度者；应用启动时拿不到锁就先不调度，每 3 秒重试，拿到后从磁盘重载一次再接管。顺带把 `saveStore` 改成「临时文件 + rename」的原子写，以及退出时 `flushStore` 把 300ms debounce 里的那次写落盘 —— 否则刚改完任务就 ⌘Q，后台读到的还是旧的 `nextRunAt`，表现就是「明明设了任务却不跑」。
+
 ---
 
 ## 已知限制
@@ -368,7 +407,9 @@ npm 的 postinstall 只把二进制硬链接到 **npm 自己的 prefix**，不�
 | 平台 | 仅 macOS。Windows / Linux 未适配（Electron 本身跨平台，但路径与进程管理要改） |
 | 代码签名 | 未签名。自行打包后首次打开需右键 → 打开，或 `xattr -dr com.apple.quarantine` |
 | 权限确认 | `default` 模式下需要确认的工具在 headless 通道里会被直接拒绝，不会弹窗问你。想让它自己干活用 `acceptEdits` |
-| 定时任务依赖主进程 | ⌘Q 退出后不再触发；"错过超过 6 小时"的任务不补跑 |
+| 后台守护精度 | launchd 60 秒一轮，任务实际触发时间和设定值最多差一分钟 |
+| 错过不补跑 | 关机 / 休眠超过 6 小时的任务醒来后跳过并记 `skipped` |
+| 后台守护仅 macOS | 用的是 launchd；Windows / Linux 没有等价实现 |
 | 任务并发 | 多个任务同时到点会各自起一个 claude 进程，没有全局并发上限 |
 | 任务通知 | 只落进应用内，没有系统通知 |
 | 产物识别 | 只认 `Write` / `Edit` 这类工具的 `file_path`；`Bash` 里重定向出来的文件不会进列表 |
@@ -381,7 +422,6 @@ npm 的 postinstall 只把二进制硬链接到 **npm 自己的 prefix**，不�
 
 - [ ] 系统通知（定时任务完成 / 失败）
 - [ ] 全局任务并发上限
-- [ ] 用 `launchd` 托管，脱离主进程跑定时任务
 - [ ] 打包脚本 + Release 产物
 - [ ] Windows / Linux 适配
 
@@ -392,6 +432,11 @@ npm 的 postinstall 只把二进制硬链接到 **npm 自己的 prefix**，不�
 ```
 claude-buddy/
 ├── main.js                     Electron 主进程 + claude 进程管理 + 事件解析 + 任务调度
+├── runner.js                   后台执行器（launchd 调用，无窗口、纯 node）
+├── lib/
+│   ├── schedule.js             下次运行时间 / 到期与过期判定
+│   ├── claude-bin.js           定位 claude、补 PATH、问登录 shell
+│   └── launchd.js              LaunchAgent 的装 / 卸 / 状态
 ├── preload.js                  contextBridge 白名单 API
 ├── renderer/
 │   ├── index.html              三栏布局 + 任务弹窗
@@ -404,7 +449,14 @@ claude-buddy/
 └── package.json
 ```
 
-调度相关代码在 `main.js` 的「定时任务调度」一节：`computeNext`（算下次时间）、`runTask`（起进程执行）、`finishTaskRun`（收口记账）、`startScheduler`（10 秒轮询）。任务数据跟会话存在同一个 `sessions.json` 里，字段是 `tasks[]`。
+调度相关代码在 `main.js` 的「定时任务调度」一节：`runTask`（起进程执行）、`finishTaskRun`（收口记账）、`startScheduler`（10 秒轮询）。「下次什么时候跑」和「claude 在哪」这两个必须两边一致的东西抽到了 `lib/` 下，由主进程和后台执行器共用：
+
+- `lib/schedule.js` — `computeNext`（算下次时间）、`dueState`（该不该跑 / 错过多久算过期）
+- `lib/claude-bin.js` — `resolve`（按优先级找 claude）、`childEnv`（补 PATH）、`probeViaShell`（问登录 shell）
+- `lib/launchd.js` — plist 生成、`bootstrap` / `bootout`、路径变更检测
+- `runner.js` — 无窗口执行器，只依赖 node 内置模块
+
+任务数据跟会话存在同一个 `sessions.json` 里，字段是 `tasks[]`。
 
 安装相关代码在「应用私有运行时」与「Claude Code 安装向导」两节：`runtimeDir`（定目录）、`runtimeClaudeBin`（带体积校验的探测）、`resolveClaudeBin`（查找优先级）、`INSTALL_METHODS`（两条命令）。
 

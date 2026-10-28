@@ -37,6 +37,20 @@
           <button class="btn-new" id="newTask">
             <span class="plus">+</span> 新建任务
           </button>
+
+          <!-- 应用关掉之后谁来跑这些任务 -->
+          <div class="bg-bar" id="bgBar">
+            <div class="bg-row">
+              <span class="bg-dot" id="bgDot"></span>
+              <span class="bg-title" id="bgTitle">后台守护</span>
+              <button class="bg-btn" id="bgBtn">开启</button>
+            </div>
+            <div class="bg-row">
+              <span class="bg-sub" id="bgSub">检查中…</span>
+              <button class="bg-link" id="bgLog" hidden title="查看后台执行日志">日志</button>
+            </div>
+          </div>
+
           <div class="session-list" id="taskList"></div>
         </div>
 

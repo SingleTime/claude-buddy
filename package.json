@@ -1,12 +1,14 @@
 {
   "name": "claude-buddy",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A macOS desktop AI agent that uses the Claude Code CLI as its runtime",
   "main": "main.js",
   "type": "commonjs",
   "scripts": {
     "start": "electron .",
-    "dev": "electron . --dev"
+    "dev": "electron . --dev",
+    "runner": "node runner.js",
+    "doctor": "node runner.js --doctor"
   },
   "keywords": [
     "claude",
@@ -34,5 +36,34 @@
   },
   "dependencies": {
     "electron": "^45.0.0"
+  },
+  "build": {
+    "appId": "com.claudebuddy.app",
+    "productName": "Claude Buddy",
+    "files": [
+      "main.js",
+      "preload.js",
+      "runner.js",
+      "lib/**/*",
+      "renderer/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "runner.js",
+        "to": "runner.js"
+      },
+      {
+        "from": "lib",
+        "to": "lib"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg"
+      ]
+    }
   }
 }

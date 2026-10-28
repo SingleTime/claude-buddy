@@ -1,0 +1,473 @@
+# Claude Buddy
+
+**把 Claude Code CLI 直接当 runtime 用的 macOS 桌面 AI 助手。**
+
+[English](README.md) · **简体中文**
+
+> A macOS desktop AI agent whose runtime *is* the Claude Code CLI — not a wrapper that shells out per message, but a live bidirectional NDJSON channel to a long-running `claude` process.
+
+[![Platform](https://img.shields.io/badge/platform-macOS%2012%2B-black)](https://github.com/SingleTime/claude-buddy)
+[![Electron](https://img.shields.io/badge/electron-45-47848f)](https://www.electronjs.org/)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Runtime deps](https://img.shields.io/badge/runtime%20deps-0-brightgreen)](package.json)
+
+---
+
+## 这是什么
+
+一个 Electron 桌面应用，主进程里给每个会话挂一个常驻的 `claude` 子进程，走 stdin/stdout 双向 NDJSON 流：
+
+```
+claude -p --input-format stream-json --output-format stream-json \
+          --include-partial-messages --verbose \
+          --permission-mode <mode> [--resume <session_id>] [--model <m>]
+```
+
+不是"发一条消息 → 起一个进程 → 等它结束 → 关掉"那种套壳。一个进程吃多轮，首轮从 `system/init` 取 `session_id`，后续 `--resume` 恢复，冷启动开销只付一次。
+
+因为 harness 就是 Claude Code 本身，**已有的 skills、MCP、settings、模型配置全部直接复用**，不需要迁移或重新适配。
+
+![主界面](assets/screenshot.png)
+
+---
+
+## 为什么不用现成的
+
+现成的桌面 AI 助手大多是封闭的：harness 不可换、模型出口不可换、MCP 凭据由平台代管、成本不透明。
+
+这个项目的取向很简单：
+
+| 维度 | 做法 |
+|---|---|
+| **harness** | 就是 Claude Code CLI，可审计、可替换、可改 |
+| **模型** | 完全自由。改 `~/.claude/settings.json` 指向任何 Anthropic 兼容端点即可，当前跑的是 `qwen3.8-flash`（1M 上下文） |
+| **云端依赖** | 无。直连你自己配的端点，不需要任何平台账号 |
+| **skills / MCP** | 直接读 `~/.claude/skills` 和 `~/.claude.json` 里的 MCP 配置 |
+| **成本可见性** | 每轮 token / 缓存命中 / 美元成本 / API 耗时，逐轮记账 |
+
+代价是生态还在早期：没有专家体系、没有多端同步、定时任务依赖主进程存活。这是一版**能日常用**的东西，不是成品。
+
+---
+
+## 功能
+
+- **多会话** — 左栏列表，自动持久化，重启恢复
+- **流式输出** — 逐字打字机，含 thinking 增量
+- **思考过程** — 折叠块，可展开
+- **工具调用卡片** — 工具名 / 参数 JSON / 执行结果 / 成功失败状态，可折叠
+- **附件** — 拖进来、点回形针、或直接 `⌘V` 粘截图；图片按 content block 内联给模型看，其他文件落进会话目录并交给 `Read`
+- **产物面板** — 右栏「产物」列出这轮写过哪些文件，图片 / 文本内联预览，其余一键交给系统程序
+- **消息队列** — 生成中继续发的内容不丢弃也不打断，排进队列，这一轮结束自动接着发
+- **会话搜索** — 侧栏按标题和正文检索历史，命中片段点一下跳过去
+- **Markdown 渲染** — 标题、列表、代码块、表格、引用、链接
+- **模型切换** — 右栏下拉，改完自动重启进程生效
+- **权限模式** — `default` / `plan` / `acceptEdits` / `bypassPermissions`
+- **工作目录** — 左下角点选，决定 agent 的操作根目录
+- **成本面板** — 本轮成本、累计成本、输入输出 token、缓存命中、耗时
+- **工具清单** — 右栏列出当前会话可用工具（含 MCP）
+- **定时任务** — 按天 / 按周 / 按间隔自动跑，结果落进独立会话
+- **后台守护** — 装一个 LaunchAgent，应用关掉（甚至没启动）也按时跑任务；没有常驻进程，到点才唤起、跑完就退
+- **缺依赖自动兜底** — 找不到 `claude` 时先查登录 shell，确认没有再引导安装；装进应用私有目录，不碰系统
+
+---
+
+## 快速开始
+
+### 前置条件
+
+1. **macOS 12+**（Apple Silicon 或 Intel）
+2. **Node.js 18+**
+3. **Claude Code CLI** 已安装并完成认证 —— 没装也没关系，应用会引导你装（见下）
+
+> Claude Code 是 Anthropic 的闭源商业产品，**不随本仓库分发**。这个项目是它的前端，
+> 自己装一份即可，应用会自动找到。想手动装（全局那份，和本项目无关）：
+>
+> ```bash
+> npm install -g @anthropic-ai/claude-code
+> curl -fsSL https://claude.ai/install.sh | bash
+> ```
+
+验证：
+
+```bash
+claude --version
+claude -p "say hi"     # 能出结果说明认证 OK
+```
+
+应用查找顺序是：`CLAUDE_BIN` 指定的路径 → **应用私有运行时** → `/opt/homebrew/bin`、`/usr/local/bin`、`~/.claude/local`、`~/.local/bin`、nvm / fnm 版本目录等常见位置 → 登录 shell 的 PATH。装在别处就用环境变量指定：
+
+```bash
+CLAUDE_BIN=/your/path/to/claude npm start
+```
+
+### 安装运行
+
+```bash
+git clone https://github.com/SingleTime/claude-buddy.git
+cd claude-buddy
+npm install
+./start-claude-buddy.command      # 或双击
+```
+
+也可以 `npm start`。
+
+> **注意**：如果终端里设了 `ELECTRON_RUN_AS_NODE=1`（某些 Electron 应用会往子进程注入），
+> 必须先 `unset ELECTRON_RUN_AS_NODE`，否则 Electron 会退化成 Node 跑，报 `whenReady undefined`。
+> `start-claude-buddy.command` 里已经处理。
+
+### 没装 Claude Code？让应用自己装
+
+启动时找不到 `claude`，会弹一个三选一的对话框：
+
+| 选项 | 行为 |
+|---|---|
+| **自动安装** | 打开安装向导，自动选安装方式并实时显示进度；装完重新探测并接管 |
+| **手动安装说明** | 跳到官方文档 |
+| **稍后** | 关掉对话框，之后可从菜单「帮助 → 安装 Claude Code…」重新打开 |
+
+安装向导里有两个方法，随时可切换：
+
+| 方法 | 命令 | 谁来用 |
+|---|---|---|
+| **npm 本地安装** | `npm install --prefix <运行时目录> @anthropic-ai/claude-code` | 有 npm 时默认走这个，装进应用私有目录 |
+| **官方安装脚本** | `curl -fsSL https://claude.ai/install.sh \| bash` | 没装 Node 时兜底，只能装到 `~/.local/bin` |
+
+### 装进自己的目录，不动系统
+
+`npm install -g` 会往全局 prefix 里塞 260MB，那个 prefix 可能是 `/opt/homebrew`、`/usr/local`（Node 用官方 pkg 装时这里还需要 sudo）、或者 nvm 的某个版本目录 —— 换个 node 版本就找不到了。所以这里用 `--prefix` 装进应用自己的运行时目录，`-g` 一个字节都不写：
+
+| 场景 | 运行时目录 |
+|---|---|
+| 开发模式（`npm start`） | `<项目>/.claude-runtime`（已 gitignore） |
+| 打包后的 .app | `~/Library/Application Support/Claude Buddy/runtime`（.app 内部只读） |
+| 自定义 | `CLAUDE_BUDDY_RUNTIME=/some/dir npm start` |
+
+好处很直接：**不写全局 prefix、不改 shell profile、不动 PATH、不需要提权**。卸载就是删掉那个目录：
+
+```bash
+rm -rf .claude-runtime                                              # 开发模式
+rm -rf ~/Library/Application\ Support/Claude\ Buddy/runtime          # 打包版
+```
+
+应用启动时**优先用私有运行时那份**，所以装完不会和系统里已有的 claude 打架；真的要在两者间切换，用 `CLAUDE_BIN` 显式指定。检测到本机已经装过（含只存在于登录 shell PATH 里的那种）就不会再装第二份，一个字节都不下载。
+
+**为什么默认 npm 而不是官方脚本。** 两条路最终装的是同一个原生二进制（`2.1.312` 实测 macOS arm64 为 263.2MB），差别在过程：
+
+- npm 包本身只有 190KB，真正的二进制靠 `optionalDependencies` 按 `os`/`cpu` 分发，`postinstall` 只是把它**硬链接**到 bin 位置。一次下载，结束。实测 `--prefix` 到空目录：**热缓存 2–3 秒、冷缓存 7 秒左右、磁盘 263MB、`claude --version` 直接可用**。
+- 官方脚本要先下 263MB 的 bootstrap 二进制，再调用它自己的 `install` 子命令去 `~/.local/bin` 铺开——多一次往返，还依赖 `downloads.claude.ai` 的区域可达性，并且**绕不开用户家目录**。
+
+所以顺序是：**有 npm 就本地装，没有才用脚本**。装了 Node 的人（跑本项目本来就要 Node）默认都会走 npm 那条。
+
+> 私有运行时里的 `.bin/claude` 指向的是**原生二进制**，不是 `node cli.js` 的包装脚本，所以运行时不需要 node 在 PATH 里。
+> 万一 `postinstall` 没跑成（`--ignore-scripts`、`--omit=optional`），那个位置会变成一个 500 字节的提示脚本；应用靠体积（>1MB）识别并判定安装失败，而不是把提示脚本当成 claude 启动。
+
+**打开向导不等于马上安装。** 它会先做一次检测，只有在确认本机确实没有时才真正执行命令：
+
+1. 查静态位置列表（Homebrew、`~/.local/bin`、`~/.claude/local`、nvm / fnm 的版本目录……）
+2. 查不到就问一次**你的登录 shell**：`$SHELL -lc 'command -v claude'`。这一步能捞到 nvm / fnm / asdf / volta 或自定义 PATH 装的 claude —— 它们只存在于 shell 的 PATH 里，GUI 进程根本看不见
+3. 还是没有，才动手安装
+
+已经装过的话向导会直接显示「本机已装，无需安装：/path/to/claude」，一个字节都不下载，也不会给你搞出第二份。
+
+命令执行完同样会**重新扫描磁盘**，只有真的找到可执行文件才报成功；否则如实说明是「退出码 0 但没产出文件」「二进制没铺开」还是「退出码非 0」，并允许换个方法重试。
+
+整个过程不写任何配置文件、不改 shell profile、不碰全局 npm 前缀。单次安装上限 10 分钟（263MB 在慢网络下要等）。
+
+![安装向导](assets/screenshot-installer.png)
+
+失败排查看向导里的日志区：`sys:` 是执行的命令与阶段，`out:` 是标准输出，`err:` 是标准错误（红色）。npm 把下载进度（`npm http …`）写在 stderr 上，这个是正常进度、不标红。常见的失败是私有目录不可写（`EACCES`，比如把 `CLAUDE_BUDDY_RUNTIME` 指到了只读位置）—— 换回默认目录或切到官方脚本即可。
+
+### 附件、产物与队列
+
+**附件**（拖入 / 回形针 / `⌘V` 粘图）：
+
+- 图片按 Anthropic 的 image content block **内联进 stream-json**，模型是真的看见图，不是先 OCR 成文字。实测 `qwen3.8-flash` 接得住（`input_tokens` 会把图像 token 算进去）。
+- 其他文件（PDF / Office / 代码……）拷进 `~/Library/Application Support/Claude Buddy/attachments/<会话 id>/`，消息里附绝对路径让模型自己 `Read`。这些路径在 cwd 之外，所以启动参数带 `--add-dir <附件目录>`，否则 `Read` 会被权限拦下来 —— 这个坑实测踩过。
+- 附件不会写进你的工作目录，删会话时一起删掉。
+
+**产物面板**：只认 `Write` / `Edit` / `MultiEdit` / `NotebookEdit` 这类工具的 `file_path`。点击内联预览（图片直接显示、文本按原样渲染，单文件上限 800KB），预览读盘限制在工作目录与附件目录内，避免模型给的路径把 `~/.ssh` 读进界面。
+
+**消息队列**：正在生成时再发一条不会丢，按顺序排进输入框上方的队列，这一轮 `result` 到了自动接着发。排队中的条目可以点 `×` 撤掉。
+
+> 工具入参偶尔会因为非官方端点截断而拿不到完整 JSON（`_raw`），解析退化成用正则捞 `file_path` 之类的字段 —— 所以产物面板在这种情况下仍然能工作。
+
+### 换成非官方模型端点
+
+默认沿用 `~/.claude/settings.json` 的配置。想指向别的 Anthropic 兼容服务，在那里加 `env`：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://your-endpoint.example.com/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "your-token",
+    "ANTHROPIC_MODEL": "your-model-name",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "your-model-name",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "your-model-name",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000"
+  }
+}
+```
+
+四档 `_DEFAULT_*_MODEL` 和 `ANTHROPIC_MODEL` 要一起改，否则内部小任务（标题生成之类）会走到别的模型上。改完重启应用，右栏下拉会显示实际模型名。
+
+---
+
+## 架构
+
+```
+┌─────────────────────────────────────────┐
+│ 渲染进程 (renderer/app.js)               │
+│  会话列表 / 消息流 / 工具卡片 / 状态面板   │
+└──────────────┬──────────────────────────┘
+               │ IPC (preload 白名单)
+┌──────────────▼──────────────────────────┐
+│ 主进程 (main.js)                          │
+│  · 会话持久化 userData/sessions.json      │
+│  · 每个会话一个常驻 claude 子进程          │
+│  · 定时任务调度器                          │
+└──────────────┬──────────────────────────┘
+               │ NDJSON over stdio
+┌──────────────▼──────────────────────────┐
+│ claude CLI (stream-json 双向通道)         │
+│  skills / MCP / permission 全由它负责      │
+└─────────────────────────────────────────┘
+```
+
+事件流被翻译成 UI 友好的增量：
+
+| 原始事件 | 用途 |
+|---|---|
+| `system/init` | 拿 `session_id`、模型名、可用工具清单 |
+| `stream_event/content_block_delta` | 打字机效果（text / thinking / tool 参数） |
+| `assistant` | 完整消息，用于校正 |
+| `user`（含 `tool_result`） | 工具执行结果回填卡片 |
+| `result` | 成本、耗时、token、缓存命中 |
+
+---
+
+## 定时任务
+
+左栏顶部切到「定时任务」→「新建任务」。
+
+![定时任务](assets/screenshot-tasks.png)
+
+| 配置项 | 说明 |
+|---|---|
+| 提示词 | 每次运行发给 Claude 的内容。**要写成能被独立执行的指令**，它看不到你之前的对话 |
+| 频率 | 每天（指定时刻）/ 每周（多选星期）/ 间隔（每 N 分钟） |
+| 工具白名单 | **最关键的一项**，见下文 |
+| 权限模式 | 默认 `acceptEdits` |
+| 工作目录 | 任务的执行根目录 |
+
+![编辑任务](assets/screenshot-task-modal.png)
+
+### 为什么必须给工具白名单
+
+无人值守时没人点「允许」，而且 `acceptEdits` **不放行 MCP 和 Bash**。实测：
+
+```bash
+$ claude -p "查 03690" --permission-mode acceptEdits
+未取到数据：mcp__finance-data__quote 的调用权限尚未授予…
+
+$ claude -p "查 03690" --permission-mode acceptEdits --allowedTools "mcp__finance-data__quote"
+03690  HK  71.85  -2.20  -2.97%
+```
+
+不给白名单，任务能"跑完"、退出码 0，但模型只会回一句"权限尚未授予"。
+
+所以新建任务时已预填一份只读白名单（`Read/Grep/Glob/WebFetch/WebSearch` + 你 MCP 里的只读工具）。需要写文件就手动加 `Write`、`Edit`，要执行 Shell 加上 `Bash`——**想清楚再放，这条命令会在你不看着的时候跑**。
+
+### 调度行为
+
+- **精度** — 10 秒轮询，实测 1 分钟间隔的实际间隔为 60 秒整
+- **错过不补跑** — 关机 / 休眠超过 6 小时的任务，醒来后直接跳过并留一条 `skipped` 记录
+- **不堆叠** — 上一次还在跑就顺延到下一周期
+- **超时** — 单次运行超过 15 分钟强制终止并记为失败
+- **会话隔离** — 每个任务固定一个 `⏱ 任务名` 会话，历史都堆在那里
+- **上下文干净** — 每次运行都是新进程 + 不 `--resume`，避免上下文逐日膨胀推高成本
+
+**建好之后先点一次「立即运行」**，确认输出确实是你想要的那个东西，再启用。定时任务无人值守，跑歪了不会有人当场发现。
+
+### 应用关掉也在跑
+
+任务面板顶部有个「后台守护」状态条。装好之后，应用**完全没启动**任务也会按时执行。
+
+原理很朴素：`~/Library/LaunchAgents/com.claudebuddy.tasks.plist` 让 launchd 每 60 秒拉起一次 `runner.js`，它读到点的任务才干活，没有就立刻退出（实测空转约 0.3 秒 / 次）。不是常驻 daemon —— 常驻进程要和应用抢同一份 `sessions.json`，两边同时写必然丢数据。
+
+只有一个调度者是关键，用磁盘锁仲裁：
+
+| 谁在跑 | 谁调度 |
+|---|---|
+| 应用开着 | 应用内定时器（10 秒精度），后台执行器拿不到锁直接退出 |
+| 应用没开 | launchd 起的 `runner.js`（60 秒精度） |
+| 应用启动时恰好后台在跑 | 应用先不调度，等它放手 → 重载磁盘 → 接管 |
+
+锁文件是 `scheduler.lock`，记 pid。应用崩溃或 `kill -9` 之后锁会残留，但执行器会检查 pid 是否还活着，死者留下的锁自动清掉 —— 实测强杀应用后，下一个 60 秒周期照常接管并跑完任务。
+
+想自己看一眼执行器的视角：
+
+```bash
+npm run doctor
+```
+
+会打印它读的目录、找到的 claude、当前锁的归属、每个任务的下次时间。日志在 `~/Library/Application Support/Claude Buddy/logs/runner.log`，状态条右侧的「日志」按钮直接打开。`runner.err` 单独存 —— 里面基本只有 Electron 未签名二进制在 launchd 下的一条无害告警。
+
+不想要就点状态条上的「关闭」，plist 和 launchd 任务一起删掉，不留残留。
+
+---
+
+## 踩过的坑
+
+都是真踩出来的，记下来省后来人时间。
+
+**1. `ELECTRON_RUN_AS_NODE=1` 让 Electron 退化成 Node**
+
+从别的 Electron 应用继承环境变量启动时，`electron .` 直接报：
+
+```
+TypeError: Cannot read properties of undefined (reading 'whenReady')
+```
+
+启动前 `unset ELECTRON_RUN_AS_NODE` 即可。
+
+**2. 一轮对话有多个 `message_start`**
+
+模型调用工具后会继续输出，产生第二个 `message_start`。最初在这个事件里清空累积状态，导致工具卡片被抹掉、历史恢复后 tools 数组为空。修法：`message_start` 只重置当前块指针，`text/thinking/tools` 是**整轮**累积的，不能清。
+
+**3. 渲染层同理**
+
+`turn_start` 不能无条件清空容器，否则工具执行后的文字会把前面的卡片冲掉。用 `started` 标志区分首次与后续。
+
+**4. `app.setName()` 改不了菜单栏**
+
+开发模式下 macOS 菜单栏第一项来自 `Electron.app` 的 `CFBundleName`，只能靠打包时设置 `productName` 才变。
+
+**5. 权限被拒时退出码仍是 0**
+
+工具被拦时 Claude 不报错，而是正常返回一段"请先批准"的文字。只看 `is_error` 会误判成成功。所以任务完成时会对响应文本做一次关键字匹配（`权限提示` / `待批准` / `not granted` 等），命中就在卡片上打黄色警告。
+
+**6. `lastRunAt` 记成了完成时间**
+
+第一版在任务结束时才写 `lastRunAt`，运行耗时被算进间隔里，实测"每 60 秒"看起来像 102 秒。改成记触发时刻，`runs[]` 里另存 `finishedAt` 和 `elapsedMs`。
+
+**7. 从 Finder 启动拿不到 shell 的 PATH**
+
+GUI 应用的 `PATH` 通常只有 `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 装的 `claude` 找不到。启动时先探常见安装路径，再拼一份补全的 `PATH` 传给子进程。
+
+**8. 内容跑题检测不出来**
+
+见过两类偶发问题，都不是配置错误：回复"本会话没有该工具"（MCP 冷启动超时，工具没挂上）、回复内容完全无关（模型侧偶发跑偏）。程序只能对权限类文字打黄色警告，**内容跑题没法自动判断**，只能偶尔翻「查看记录」。
+
+**9. `CLAUDE_BIN` 指错了会把自己的自动安装坑死**
+
+原逻辑「设了 `CLAUDE_BIN` 就无条件用它」有个死循环：用户填了一个不存在的路径 → 应用提示找不到 → 引导自动安装 → 装成功了，但下一轮仍然用那个错路径 → 还是找不到。改成先验证存在才采纳，失效就退回自动探测。
+
+**10. 安装命令退出码 0 不等于装好了**
+
+`curl | bash` 可能因为权限、网络或镜像问题中途放弃却返回 0。所以判定成功不靠退出码，而是**重新扫一遍磁盘**，真找到可执行文件才算成功；没找到就按退出码区分两种原因分别提示。
+
+**11. 装了 claude 却被判成"没装"，然后被诱导再装一份**
+
+`resolveClaudeBin()` 探的是写死的位置列表 + 本进程的 PATH。本进程是 GUI 应用，PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`；靠 nvm / fnm / asdf / volta 或自定义 PATH 装的 claude，**静态列表一个都够不着**。于是应用判定"没装"，而自动安装会再装一个全局副本 —— 两个版本谁在前全看 PATH 顺序，比不装还糟。
+
+解法：探不到时问一次用户的登录 shell（`$SHELL -lc 'command -v claude'`），它会加载 `.zshrc` / `.bash_profile` 里的 PATH。只认绝对路径那一行，避免把 `command -v` 返回的别名/函数定义当成可执行文件；带 8 秒超时，防止某些人的 rc 文件里有网络请求卡死启动。
+
+**12. `npm install -g` 装完，用户自己却敲不到 `claude`**
+
+npm 的 postinstall 只把二进制硬链接到 **npm 自己的 prefix**，不会去改 shell profile。Node 用 nvm / fnm 装的人，`npm install -g` 落在版本目录里，新开终端 `claude` 照样 command not found；`/usr/local` 那种 prefix 还可能因为权限要 sudo。这是换个位置装就能绕开的麻烦 —— 索性改成 `--prefix` 装进应用私有目录，用户系统里一个字节都不留。
+
+**13. 私有安装里 `.bin/claude` 可能只是个提示脚本**
+
+`npm install --ignore-scripts`（或 `--omit=optional`）时，`@anthropic-ai/claude-code` 的 `bin/claude.exe` 不是原生二进制，而是一个 **500 字节、可执行、会打印错误并 `exit 1`** 的 shell 提示。只判断"文件存在 + 有 x 位"会把它当成 claude 启动，症状是每轮对话都莫名其妙退出。判据换成体积：真实二进制 260MB 以上，小于 1MB 一律当没装。
+
+**14. 附件放在 cwd 之外，`Read` 直接被拒**
+
+附件落在 `userData/attachments/` 下，不在工作目录里。第一版只把路径写进消息，模型老老实实调 `Read`，然后拿到一句「Claude requested permissions to read from ... but you haven't granted it yet」—— headless 通道里没人能点「允许」，这轮就废了。修法：起进程时带 `--add-dir <该会话的附件目录>`，把附件目录显式加进可访问范围。
+
+**15. 换模型时旧进程的退出会把新一轮状态踩掉**
+
+`config:update` 会杀掉旧 runner 重起。旧进程的 `exit` 事件是异步的，如果这时候用户已经发了下一条，`proc_exit` 处理器会把新一轮的 `busy` 重置成 false、还会 `runners.delete(session.id)` 把**新**进程从表里删掉 —— 之后写进 stdin 的消息全部落空，界面留一个空气泡。修法：退出时先比对 `runners.get(id).proc === proc`，不是自己就不动表；事件里带上 `current` 标志，渲染层忽略旧进程的 `proc_exit`。
+
+**16. headless 里等 `close` 会永远等下去**
+
+后台执行器第一版照着常驻会话的写法：`spawn` 完写一行 user message，然后等 `proc.on("close")` 收口。结果任务状态卡在 `running` 直到 15 分钟超时 —— 因为 stdin 一直开着（常驻会话本来就要一直开着），claude 输出完 `result` 之后**不会退出**，它还在等下一条消息。
+
+修法：`result` 是这一轮最后一个事件，收到就地收口，然后 `stdin.end()` 发 EOF 让它自己退，3 秒不退再 `SIGTERM`。判断「这轮结束了」不能靠进程退出码。
+
+**17. 两个调度者同时写 `sessions.json`**
+
+launchd 每 60 秒拉起执行器，而应用自己也有定时器。如果不管，应用开着的时候执行器照样跑，同一次任务可能跑两遍，而且两边各自把整份 store 序列化写回去 —— 后写的把先写的覆盖掉。
+
+修法：磁盘锁 `scheduler.lock`（`wx` 原子创建 + pid 存活判定），同一时刻只有一个调度者；应用启动时拿不到锁就先不调度，每 3 秒重试，拿到后从磁盘重载一次再接管。顺带把 `saveStore` 改成「临时文件 + rename」的原子写，以及退出时 `flushStore` 把 300ms debounce 里的那次写落盘 —— 否则刚改完任务就 ⌘Q，后台读到的还是旧的 `nextRunAt`，表现就是「明明设了任务却不跑」。
+
+---
+
+## 已知限制
+
+| 项 | 说明 |
+|---|---|
+| 平台 | 仅 macOS。Windows / Linux 未适配（Electron 本身跨平台，但路径与进程管理要改） |
+| 代码签名 | 未签名。自行打包后首次打开需右键 → 打开，或 `xattr -dr com.apple.quarantine` |
+| 权限确认 | `default` 模式下需要确认的工具在 headless 通道里会被直接拒绝，不会弹窗问你。想让它自己干活用 `acceptEdits` |
+| 后台守护精度 | launchd 60 秒一轮，任务实际触发时间和设定值最多差一分钟 |
+| 错过不补跑 | 关机 / 休眠超过 6 小时的任务醒来后跳过并记 `skipped` |
+| 后台守护仅 macOS | 用的是 launchd；Windows / Linux 没有等价实现 |
+| 任务并发 | 多个任务同时到点会各自起一个 claude 进程，没有全局并发上限 |
+| 任务通知 | 只落进应用内，没有系统通知 |
+| 产物识别 | 只认 `Write` / `Edit` 这类工具的 `file_path`；`Bash` 里重定向出来的文件不会进列表 |
+| 队列不持久化 | 排队中的消息只在内存里，切会话或退出就没了 |
+| 私有运行时只在应用内可见 | 应用自己装的那份不会进 PATH，终端里敲 `claude` 不会有。要在终端用就自己 `npm i -g` 一份，应用会优先用自己那份 |
+
+---
+
+## 路线图
+
+- [ ] 系统通知（定时任务完成 / 失败）
+- [ ] 全局任务并发上限
+- [ ] 打包脚本 + Release 产物
+- [ ] Windows / Linux 适配
+
+---
+
+## 文件结构
+
+```
+claude-buddy/
+├── main.js                     Electron 主进程 + claude 进程管理 + 事件解析 + 任务调度
+├── runner.js                   后台执行器（launchd 调用，无窗口、纯 node）
+├── lib/
+│   ├── schedule.js             下次运行时间 / 到期与过期判定
+│   ├── claude-bin.js           定位 claude、补 PATH、问登录 shell
+│   └── launchd.js              LaunchAgent 的装 / 卸 / 状态
+├── preload.js                  contextBridge 白名单 API
+├── renderer/
+│   ├── index.html              三栏布局 + 任务弹窗
+│   ├── style.css               深色主题
+│   ├── app.js                  markdown 渲染 / 流式打字 / 工具卡片 / 会话与任务管理
+│   └── installer.html          Claude Code 安装向导
+├── start-claude-buddy.command  双击启动（已处理环境变量）
+├── assets/                     截图
+├── .claude-runtime/            应用私有 claude（运行时生成，已 gitignore）
+└── package.json
+```
+
+调度相关代码在 `main.js` 的「定时任务调度」一节：`runTask`（起进程执行）、`finishTaskRun`（收口记账）、`startScheduler`（10 秒轮询）。「下次什么时候跑」和「claude 在哪」这两个必须两边一致的东西抽到了 `lib/` 下，由主进程和后台执行器共用：
+
+- `lib/schedule.js` — `computeNext`（算下次时间）、`dueState`（该不该跑 / 错过多久算过期）
+- `lib/claude-bin.js` — `resolve`（按优先级找 claude）、`childEnv`（补 PATH）、`probeViaShell`（问登录 shell）
+- `lib/launchd.js` — plist 生成、`bootstrap` / `bootout`、路径变更检测
+- `runner.js` — 无窗口执行器，只依赖 node 内置模块
+
+任务数据跟会话存在同一个 `sessions.json` 里，字段是 `tasks[]`。
+
+安装相关代码在「应用私有运行时」与「Claude Code 安装向导」两节：`runtimeDir`（定目录）、`runtimeClaudeBin`（带体积校验的探测）、`resolveClaudeBin`（查找优先级）、`INSTALL_METHODS`（两条命令）。
+
+会话数据在 `~/Library/Application Support/Claude Buddy/sessions.json`。
+
+---
+
+## 许可
+
+[MIT](LICENSE)
+
+本项目是 Claude Code CLI 的独立前端，与 Anthropic 无关联。使用前请自行确认你对所接入模型服务的使用条款。

@@ -1,0 +1,94 @@
+name: CI
+
+# 这个项目只在 macOS 上跑，但两件事都能在 Linux 上验证：
+# 语法、以及 lib/ 下那些纯函数（调度计算不碰 fs / electron）。
+# macOS runner 消耗 10 倍免费分钟数，没必要为了「应用是 macOS 的」
+# 就把不依赖平台的检查也拖上去。
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Syntax + unit tests (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 是 package.json engines 的下限，22 是本地开发版本
+        node: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # electron 在 dependencies 里，npm ci 会拉 100MB+ 的二进制。
+      # 这里只跑 node 测试，不需要它。
+      - name: Install
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+        run: npm ci --no-audit --no-fund
+
+      - name: Syntax check all tracked JS
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            if node --check "$f"; then
+              echo "  ok  $f"
+            else
+              echo "  FAIL $f"
+              fail=1
+            fi
+          done < <(git ls-files '*.js')
+          exit $fail
+
+      - name: Unit tests
+        run: node --test
+
+      - name: Verify every lib module loads standalone
+        # 主进程和 headless 执行器共用 lib/，任何一个模块在 require 阶段
+        # 就崩掉的话，两边都会起不来 —— 而且症状是「应用打不开」，
+        # 很难定位到具体文件。
+        run: |
+          set -euo pipefail
+          for f in lib/*.js; do
+            node -e "require('./$f')" && echo "  ok  $f"
+          done
+
+  docs:
+    name: README stays bilingual
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 英文清单站（awesome-mac、open-source-mac-os-apps 等）要求主 README
+      # 为英文；中文全文必须留在 README.zh-CN.md。这条检查防的是「又被写成
+      # 单语」，不是格式洁癖。
+      - name: Both READMEs exist and link to each other
+        run: |
+          set -euo pipefail
+          test -f README.md       || { echo "README.md missing"; exit 1; }
+          test -f README.zh-CN.md || { echo "README.zh-CN.md missing"; exit 1; }
+          grep -q 'README.zh-CN.md' README.md       || { echo "README.md doesn't link to the Chinese version"; exit 1; }
+          grep -q 'README.md'       README.zh-CN.md || { echo "README.zh-CN.md doesn't link back to English"; exit 1; }
+          echo "ok"
+
+      - name: Version in package.json is a plain semver
+        run: |
+          set -euo pipefail
+          v=$(node -p "require('./package.json').version")
+          echo "version: $v"
+          echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not semver: $v"; exit 1; }

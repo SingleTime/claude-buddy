@@ -7,8 +7,11 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
+    "test": "node --test",
     "runner": "node runner.js",
-    "doctor": "node runner.js --doctor"
+    "doctor": "node runner.js --doctor",
+    "pack": "electron-builder --mac --arm64",
+    "pack:all": "electron-builder --mac --arm64 --x64"
   },
   "keywords": [
     "claude",
@@ -34,12 +37,11 @@
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {
-    "electron": "^45.0.0"
-  },
+  "dependencies": {},
   "build": {
     "appId": "com.claudebuddy.app",
     "productName": "Claude Buddy",
+    "artifactName": "Claude-Buddy-${version}-${arch}.${ext}",
     "files": [
       "main.js",
       "preload.js",
@@ -62,8 +64,13 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [
-        "dmg"
+        "dmg",
+        "zip"
       ]
     }
+  },
+  "devDependencies": {
+    "electron": "^45.0.0",
+    "electron-builder": "^26.18.0"
   }
 }

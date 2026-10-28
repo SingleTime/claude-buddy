@@ -227,7 +227,8 @@
     <header>
       <h1>安装 Claude Code</h1>
       <div class="sub">
-        先检查本机是否已经装了，只有确实没有才安装。有 npm 走 npm，没有就用官方脚本。
+        先检查本机是否已经装了，只有确实没有才安装。<br />
+        有 npm 就装进应用私有目录（不写全局、不改 PATH、不需要 sudo），没有才用官方脚本。
       </div>
       <div class="cmd-row" id="cmdRow">
         <span class="tag" id="methodTag">官方脚本</span>
@@ -260,6 +261,9 @@
       let method = "script";
       let phase = "idle";
       let hasOutput = false;
+
+      // 路径太长会把状态栏撑满，家目录折成 ~
+      const short = (p) => String(p || "").replace(/^\/Users\/[^/]+/, "~");
 
       function appendLine({ stream, text }) {
         if (!hasOutput) {
@@ -301,12 +305,12 @@
             setStatus("running", '<span class="spin"></span>正在安装，请勿关闭窗口…');
             cmdRow.hidden = false;
           } else if (s.phase === "present") {
-            setStatus("present", "本机已装，无需安装：<b>" + s.bin + "</b>");
+            setStatus("present", "本机已装，无需安装：<b>" + short(s.bin) + "</b>");
             cmdRow.hidden = true;
             btnClose.textContent = "完成";
             btnClose.classList.add("primary");
           } else if (s.phase === "success") {
-            setStatus("success", "安装完成，已找到 <b>" + s.bin + "</b>。关闭本窗口即可开始对话。");
+            setStatus("success", "安装完成，已找到 <b>" + short(s.bin) + "</b>。关闭本窗口即可开始对话。");
             cmdRow.hidden = false;
             btnClose.textContent = "完成";
             btnClose.classList.add("primary");

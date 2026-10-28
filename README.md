@@ -60,7 +60,7 @@ claude -p --input-format stream-json --output-format stream-json \
 - **成本面板** — 本轮成本、累计成本、输入输出 token、缓存命中、耗时
 - **工具清单** — 右栏列出当前会话可用工具（含 MCP）
 - **定时任务** — 按天 / 按周 / 按间隔自动跑，结果落进独立会话
-- **缺依赖自动兜底** — 找不到 `claude` 时先查登录 shell，确认没有再引导安装
+- **缺依赖自动兜底** — 找不到 `claude` 时先查登录 shell，确认没有再引导安装；装进应用私有目录，不碰系统
 
 ---
 
@@ -73,7 +73,7 @@ claude -p --input-format stream-json --output-format stream-json \
 3. **Claude Code CLI** 已安装并完成认证 —— 没装也没关系，应用会引导你装（见下）
 
 > Claude Code 是 Anthropic 的闭源商业产品，**不随本仓库分发**。这个项目是它的前端，
-> 自己装一份即可，应用会自动找到。想手动装：
+> 自己装一份即可，应用会自动找到。想手动装（全局那份，和本项目无关）：
 >
 > ```bash
 > npm install -g @anthropic-ai/claude-code
@@ -87,7 +87,7 @@ claude --version
 claude -p "say hi"     # 能出结果说明认证 OK
 ```
 
-应用会自动在 `/opt/homebrew/bin`、`/usr/local/bin`、`~/.claude/local`、`~/.local/bin` 等常见位置找 `claude`。装在别处就用环境变量指定：
+应用查找顺序是：`CLAUDE_BIN` 指定的路径 → **应用私有运行时** → `/opt/homebrew/bin`、`/usr/local/bin`、`~/.claude/local`、`~/.local/bin`、nvm / fnm 版本目录等常见位置 → 登录 shell 的 PATH。装在别处就用环境变量指定：
 
 ```bash
 CLAUDE_BIN=/your/path/to/claude npm start
@@ -122,15 +122,37 @@ npm install
 
 | 方法 | 命令 | 谁来用 |
 |---|---|---|
-| **npm 全局安装** | `npm install -g @anthropic-ai/claude-code` | 有 npm 时默认走这个 |
-| **官方安装脚本** | `curl -fsSL https://claude.ai/install.sh \| bash` | 没装 Node 时兜底 |
+| **npm 本地安装** | `npm install --prefix <运行时目录> @anthropic-ai/claude-code` | 有 npm 时默认走这个，装进应用私有目录 |
+| **官方安装脚本** | `curl -fsSL https://claude.ai/install.sh \| bash` | 没装 Node 时兜底，只能装到 `~/.local/bin` |
 
-**为什么默认 npm 而不是官方脚本。** 两条路最终装的是同一个原生二进制（263MB，`2.1.312` 实测 macOS arm64 为 263.2MB），差别在过程：
+### 装进自己的目录，不动系统
 
-- npm 包本身只有 190KB，真正的二进制靠 `optionalDependencies` 按 `os`/`cpu` 分发，`postinstall` 只是把它**硬链接**到 bin 位置。一次下载，结束。实测 `npm install -g` 到临时前缀：**7 秒、273MB 磁盘、`claude --version` 直接可用**。
-- 官方脚本要先下 263MB 的 bootstrap 二进制，再调用它自己的 `install` 子命令去 `~/.local/bin` 铺开——多一次往返，还依赖 `downloads.claude.ai` 的区域可达性。
+`npm install -g` 会往全局 prefix 里塞 260MB，那个 prefix 可能是 `/opt/homebrew`、`/usr/local`（Node 用官方 pkg 装时这里还需要 sudo）、或者 nvm 的某个版本目录 —— 换个 node 版本就找不到了。所以这里用 `--prefix` 装进应用自己的运行时目录，`-g` 一个字节都不写：
 
-所以顺序是：**有 npm 就走 npm，没有才用脚本**。装了 Node 的人（跑本项目本来就要 Node）默认都会走 npm 那条。
+| 场景 | 运行时目录 |
+|---|---|
+| 开发模式（`npm start`） | `<项目>/.claude-runtime`（已 gitignore） |
+| 打包后的 .app | `~/Library/Application Support/Claude Buddy/runtime`（.app 内部只读） |
+| 自定义 | `CLAUDE_BUDDY_RUNTIME=/some/dir npm start` |
+
+好处很直接：**不写全局 prefix、不改 shell profile、不动 PATH、不需要提权**。卸载就是删掉那个目录：
+
+```bash
+rm -rf .claude-runtime                                              # 开发模式
+rm -rf ~/Library/Application\ Support/Claude\ Buddy/runtime          # 打包版
+```
+
+应用启动时**优先用私有运行时那份**，所以装完不会和系统里已有的 claude 打架；真的要在两者间切换，用 `CLAUDE_BIN` 显式指定。检测到本机已经装过（含只存在于登录 shell PATH 里的那种）就不会再装第二份，一个字节都不下载。
+
+**为什么默认 npm 而不是官方脚本。** 两条路最终装的是同一个原生二进制（`2.1.312` 实测 macOS arm64 为 263.2MB），差别在过程：
+
+- npm 包本身只有 190KB，真正的二进制靠 `optionalDependencies` 按 `os`/`cpu` 分发，`postinstall` 只是把它**硬链接**到 bin 位置。一次下载，结束。实测 `--prefix` 到空目录：**热缓存 2–3 秒、冷缓存 7 秒左右、磁盘 263MB、`claude --version` 直接可用**。
+- 官方脚本要先下 263MB 的 bootstrap 二进制，再调用它自己的 `install` 子命令去 `~/.local/bin` 铺开——多一次往返，还依赖 `downloads.claude.ai` 的区域可达性，并且**绕不开用户家目录**。
+
+所以顺序是：**有 npm 就本地装，没有才用脚本**。装了 Node 的人（跑本项目本来就要 Node）默认都会走 npm 那条。
+
+> 私有运行时里的 `.bin/claude` 指向的是**原生二进制**，不是 `node cli.js` 的包装脚本，所以运行时不需要 node 在 PATH 里。
+> 万一 `postinstall` 没跑成（`--ignore-scripts`、`--omit=optional`），那个位置会变成一个 500 字节的提示脚本；应用靠体积（>1MB）识别并判定安装失败，而不是把提示脚本当成 claude 启动。
 
 **打开向导不等于马上安装。** 它会先做一次检测，只有在确认本机确实没有时才真正执行命令：
 
@@ -140,13 +162,13 @@ npm install
 
 已经装过的话向导会直接显示「本机已装，无需安装：/path/to/claude」，一个字节都不下载，也不会给你搞出第二份。
 
-命令执行完同样会**重新扫描磁盘**，只有真的找到可执行文件才报成功；否则如实说明是「退出码 0 但没产出文件」还是「退出码非 0」，并允许换个方法重试。检测时还会问一次 `npm prefix -g` —— npm 的全局 bin 可能是 homebrew、nvm 版本目录或自定义位置，不能假定 `/usr/local/bin`。
+命令执行完同样会**重新扫描磁盘**，只有真的找到可执行文件才报成功；否则如实说明是「退出码 0 但没产出文件」「二进制没铺开」还是「退出码非 0」，并允许换个方法重试。
 
-整个过程不写任何配置文件、不改 shell profile。单次安装上限 10 分钟（263MB 在慢网络下要等）。
+整个过程不写任何配置文件、不改 shell profile、不碰全局 npm 前缀。单次安装上限 10 分钟（263MB 在慢网络下要等）。
 
 ![安装向导](assets/screenshot-installer.png)
 
-失败排查看向导里的日志区：`sys:` 是执行的命令与阶段，`out:` 是标准输出，`err:` 是标准错误（红色）。最常见的失败是 npm 全局目录没权限（`EACCES`，Node 用官方 pkg 装的时候 `/usr/local/lib` 需要 sudo）—— 这时切到官方脚本就能绕过，它装进 `~/.local/bin`，不需要任何写权限提升。
+失败排查看向导里的日志区：`sys:` 是执行的命令与阶段，`out:` 是标准输出，`err:` 是标准错误（红色）。npm 把下载进度（`npm http …`）写在 stderr 上，这个是正常进度、不标红。常见的失败是私有目录不可写（`EACCES`，比如把 `CLAUDE_BUDDY_RUNTIME` 指到了只读位置）—— 换回默认目录或切到官方脚本即可。
 
 ### 换成非官方模型端点
 
@@ -303,6 +325,14 @@ GUI 应用的 `PATH` 通常只有 `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 装
 
 解法：探不到时问一次用户的登录 shell（`$SHELL -lc 'command -v claude'`），它会加载 `.zshrc` / `.bash_profile` 里的 PATH。只认绝对路径那一行，避免把 `command -v` 返回的别名/函数定义当成可执行文件；带 8 秒超时，防止某些人的 rc 文件里有网络请求卡死启动。
 
+**12. `npm install -g` 装完，用户自己却敲不到 `claude`**
+
+npm 的 postinstall 只把二进制硬链接到 **npm 自己的 prefix**，不会去改 shell profile。Node 用 nvm / fnm 装的人，`npm install -g` 落在版本目录里，新开终端 `claude` 照样 command not found；`/usr/local` 那种 prefix 还可能因为权限要 sudo。这是换个位置装就能绕开的麻烦 —— 索性改成 `--prefix` 装进应用私有目录，用户系统里一个字节都不留。
+
+**13. 私有安装里 `.bin/claude` 可能只是个提示脚本**
+
+`npm install --ignore-scripts`（或 `--omit=optional`）时，`@anthropic-ai/claude-code` 的 `bin/claude.exe` 不是原生二进制，而是一个 **500 字节、可执行、会打印错误并 `exit 1`** 的 shell 提示。只判断"文件存在 + 有 x 位"会把它当成 claude 启动，症状是每轮对话都莫名其妙退出。判据换成体积：真实二进制 260MB 以上，小于 1MB 一律当没装。
+
 ---
 
 ## 已知限制
@@ -316,6 +346,7 @@ GUI 应用的 `PATH` 通常只有 `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 装
 | 定时任务依赖主进程 | ⌘Q 退出后不再触发；"错过超过 6 小时"的任务不补跑 |
 | 任务并发 | 多个任务同时到点会各自起一个 claude 进程，没有全局并发上限 |
 | 任务通知 | 只落进应用内，没有系统通知 |
+| 私有运行时只在应用内可见 | 应用自己装的那份不会进 PATH，终端里敲 `claude` 不会有。要在终端用就自己 `npm i -g` 一份，应用会优先用自己那份 |
 
 ---
 
@@ -343,10 +374,13 @@ claude-buddy/
 │   └── installer.html          Claude Code 安装向导
 ├── start-claude-buddy.command  双击启动（已处理环境变量）
 ├── assets/                     截图
+├── .claude-runtime/            应用私有 claude（运行时生成，已 gitignore）
 └── package.json
 ```
 
 调度相关代码在 `main.js` 的「定时任务调度」一节：`computeNext`（算下次时间）、`runTask`（起进程执行）、`finishTaskRun`（收口记账）、`startScheduler`（10 秒轮询）。任务数据跟会话存在同一个 `sessions.json` 里，字段是 `tasks[]`。
+
+安装相关代码在「应用私有运行时」与「Claude Code 安装向导」两节：`runtimeDir`（定目录）、`runtimeClaudeBin`（带体积校验的探测）、`resolveClaudeBin`（查找优先级）、`INSTALL_METHODS`（两条命令）。
 
 会话数据在 `~/Library/Application Support/Claude Buddy/sessions.json`。
 

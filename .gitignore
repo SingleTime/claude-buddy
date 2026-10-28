@@ -1,6 +1,9 @@
 # 依赖
 node_modules/
 
+# 应用私有运行时（应用内一键安装的 claude，260MB，绝不入库）
+.claude-runtime/
+
 # 构建产物（体积大，用 Release 分发）
 dist/
 out/

@@ -14,6 +14,63 @@ const os = require("node:os");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 
+app.setName("Claude Buddy");
+
+/* ------------------------------------------------------------------ */
+/* 应用私有运行时                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * claude 装在哪。
+ *
+ * 不走 `npm install -g`：那会往全局 prefix（/opt/homebrew、/usr/local、nvm 的
+ * 版本目录）里塞 260MB，没准还要 sudo，卸载时也容易漏。
+ * 这里装进应用自己的目录，一个 `rm -rf` 就等于干净卸载，不碰 shell profile、
+ * 不动 PATH、不留任何系统级痕迹。
+ *
+ *   开发模式 → <项目>/.claude-runtime
+ *   打包之后 → ~/Library/Application Support/Claude Buddy/runtime
+ *              （.app 内部是只读的，写不进去，只能落到 userData）
+ *
+ * 想放到别处就设 CLAUDE_BUDDY_RUNTIME。
+ */
+function runtimeDir() {
+  const override = process.env.CLAUDE_BUDDY_RUNTIME;
+  if (override) return path.resolve(override);
+
+  // 开发模式直接放项目里，方便看一眼装了什么；打包后 __dirname 在 app.asar 内
+  if (!__dirname.includes(".asar")) return path.join(__dirname, ".claude-runtime");
+
+  try {
+    return path.join(app.getPath("userData"), "runtime");
+  } catch {
+    return path.join(os.homedir(), ".claude-buddy", "runtime");
+  }
+}
+
+/**
+ * 私有运行时里的 claude。
+ *
+ * postinstall 没跑（--ignore-scripts、--omit=optional）时，`.bin/claude` 指向的
+ * 只是一个 500 字节的提示脚本；它虽然可执行，跑起来只会打印错误然后退出 1。
+ * 所以不能只看存在与否 —— 真实的原生二进制有 260MB 以上，用体积区分。
+ */
+function runtimeClaudeBin() {
+  const link = path.join(runtimeDir(), "node_modules", ".bin", "claude");
+  try {
+    const real = fs.realpathSync(link);
+    if (fs.statSync(real).size > 1024 * 1024) return link;
+  } catch {
+    /* 没装过 */
+  }
+  return null;
+}
+
+/** 单引号包裹，供只拼自家路径的 shell 命令使用 */
+function shellQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
 /**
  * 定位 claude 可执行文件。
  *
@@ -57,6 +114,10 @@ function resolveClaudeBin() {
       /* 无效路径，继续探测 */
     }
   }
+
+  // 应用自己装的那份优先：它跟着 app 走，版本可预期，也不用猜用户的 PATH
+  const own = runtimeClaudeBin();
+  if (own) return own;
 
   for (const p of claudeCandidates()) {
     try {
@@ -165,53 +226,6 @@ function probeViaShell(name) {
 
 const probeClaudeViaShell = () => probeViaShell("claude");
 
-/** 跑一条命令拿 stdout（用于问 npm prefix -g 这类一次性查询） */
-function runCapture(cmd, timeoutMs) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (v) => {
-      if (!settled) {
-        settled = true;
-        resolve(v);
-      }
-    };
-
-    const shell = process.env.SHELL || safeUserShell() || "/bin/bash";
-    let proc;
-    try {
-      proc = spawn(shell, ["-lc", cmd], {
-        env: childEnv(),
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-    } catch {
-      return finish("");
-    }
-
-    const timer = setTimeout(() => {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        /* 已经退出 */
-      }
-      finish("");
-    }, timeoutMs || 10000);
-
-    let out = "";
-    proc.stdout.setEncoding("utf8");
-    proc.stdout.on("data", (c) => {
-      out += c;
-    });
-    proc.on("error", () => {
-      clearTimeout(timer);
-      finish("");
-    });
-    proc.on("close", () => {
-      clearTimeout(timer);
-      finish(out.trim());
-    });
-  });
-}
-
 function safeUserShell() {
   try {
     const s = os.userInfo().shell;
@@ -237,22 +251,11 @@ async function ensureClaude() {
 }
 
 /**
- * npm 的全局 bin 目录。
- *
- * 不能假定 /usr/local/bin：npm 前缀可能是 homebrew、nvm 的版本目录、
- * ~/.npm-global，或者用户自己 set 的。问 npm 自己最靠谱。
- */
-async function npmGlobalBinDir() {
-  const prefix = await runCapture("npm prefix -g");
-  if (!prefix || !prefix.startsWith("/")) return "";
-  return path.join(prefix, "bin");
-}
-
-/**
  * 默认用哪种方式装。
  *
- * 优先 npm：它一次下载 + 硬链接铺开，路径最短；官方脚本还要再调用下载下来的
- * 那个二进制自己的 `install` 子命令去二次铺开，步骤更多、输出更不可控。
+ * 优先 npm：它一次下载 + 硬链接铺开，而且可以 `--prefix` 指定目录，
+ * 装进应用私有运行时，不碰全局 prefix、不改 PATH、不需要 sudo。
+ * 官方脚本只会装到 ~/.local/bin，绕不开用户家目录，所以只作兜底。
  *
  * 但 npm 只在已经装了 Node 时才有意义 —— 没有就退回官方脚本（不依赖 Node）。
  */
@@ -278,8 +281,6 @@ function childEnv() {
   for (const p of extra) if (!merged.includes(p)) merged.push(p);
   return { ...process.env, PATH: merged.join(path.delimiter) };
 }
-
-app.setName("Claude Buddy");
 
 const PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions"];
 
@@ -1148,12 +1149,22 @@ function buildMenu() {
 /* ------------------------------------------------------------------ */
 
 /**
- * 只有这两条命令，不做任何拼接。
- * 用户输入永远不进 shell —— 这是无人值守场景能接受的最低安全线。
+ * 只有这两条命令。路径由代码自己拼，用户输入永远不进 shell ——
+ * 这是无人值守场景能接受的最低安全线。
+ * cmd 是函数：npm 那条要带上运行时目录，而目录在打包前后不一样。
  */
 const INSTALL_METHODS = {
-  script: { label: "官方安装脚本", cmd: "curl -fsSL https://claude.ai/install.sh | bash" },
-  npm: { label: "npm 全局安装", cmd: "npm install -g @anthropic-ai/claude-code" },
+  script: {
+    label: "官方安装脚本",
+    // 官方脚本只会装到 ~/.local/bin，绕不开用户家目录
+    cmd: () => "curl -fsSL https://claude.ai/install.sh | bash",
+  },
+  npm: {
+    label: "npm 本地安装",
+    cmd: () =>
+      `npm install --prefix ${shellQuote(runtimeDir())} --no-audit --no-fund ` +
+      `--loglevel=http @anthropic-ai/claude-code`,
+  },
 };
 
 let installWin = null;
@@ -1237,7 +1248,10 @@ async function startInstall(method) {
   if (autoPicked) {
     installSend("install:log", {
       stream: "sys",
-      text: installMethod === "npm" ? "检测到 npm，用 npm 安装" : "没装 npm，用官方脚本安装",
+      text:
+        installMethod === "npm"
+          ? `检测到 npm，装到应用私有目录：${runtimeDir()}`
+          : "没装 npm，用官方脚本安装（会装到 ~/.local/bin）",
     });
   }
   installSend("install:log", { stream: "sys", text: "未检测到 claude，开始安装" });
@@ -1245,17 +1259,24 @@ async function startInstall(method) {
   if (installProc) return;
 
   const m = INSTALL_METHODS[installMethod];
+  const cmd = m.cmd();
   installSend("install:state", {
     phase: "running",
     method: installMethod,
     label: m.label,
-    cmd: m.cmd,
+    cmd,
   });
-  installSend("install:log", { stream: "sys", text: `$ ${m.cmd}` });
+  installSend("install:log", { stream: "sys", text: `$ ${cmd}` });
+  if (installMethod === "npm") {
+    installSend("install:log", {
+      stream: "sys",
+      text: "不写全局 prefix、不改 shell profile，卸载时删掉这个目录即可",
+    });
+  }
 
   let proc;
   try {
-    proc = spawn("/bin/bash", ["-lc", m.cmd], {
+    proc = spawn("/bin/bash", ["-lc", cmd], {
       env: childEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -1279,7 +1300,10 @@ async function startInstall(method) {
 
   const pipe = (stream) => (chunk) => {
     for (const line of String(chunk).split("\n")) {
-      if (line.trim()) installSend("install:log", { stream, text: line });
+      if (!line.trim()) continue;
+      // npm 把下载进度（npm http …）写到 stderr，这不是错误，别标红吓人
+      const progress = /^npm (http|warn) /.test(line);
+      installSend("install:log", { stream: progress ? "out" : stream, text: line });
     }
   };
   proc.stdout.setEncoding("utf8");
@@ -1298,32 +1322,41 @@ async function startInstall(method) {
     installProc = null;
 
     // 不信任退出码，只认磁盘上真的有没有：curl | bash 会在权限/网络问题下
-    // 中途放弃却仍然返回 0。npm 装进版本管理器时也要靠登录 shell 才看得见。
+    // 中途放弃却仍然返回 0。私有运行时同理 —— npm 可能只铺了一半。
     let bin = rescanClaudeBin() || (await ensureClaude());
-
-    // 最后一道：直接问 npm 把 bin 放哪了。npm 的 prefix 可能是 homebrew、
-    // nvm 版本目录或自定义位置，登录 shell 的 PATH 里也不一定有
-    if (!bin) {
-      const nb = await npmGlobalBinDir();
-      const cand = nb && path.join(nb, "claude");
-      if (cand && fs.existsSync(cand)) {
-        CLAUDE_BIN = cand;
-        bin = cand;
-      }
-    }
 
     if (bin) {
       installSend("install:log", { stream: "ok", text: `找到 claude：${bin}` });
+      if (installMethod === "npm") {
+        installSend("install:log", {
+          stream: "sys",
+          text: `私有运行时：${runtimeDir()}（删掉这个目录就等于卸载）`,
+        });
+      }
       installSend("install:state", { phase: "success", bin });
-    } else {
-      installSend("install:state", {
-        phase: "error",
-        message:
-          code === 0
-            ? "命令已执行完，但仍没找到 claude 可执行文件"
-            : `安装退出码 ${code}`,
-      });
+      return;
     }
+
+    // 走到了这里说明磁盘上确实没有可用的 claude。区分几种失败原因，
+    // 别让用户对着「退出码 0」发懵。
+    let message;
+    if (installMethod === "npm") {
+      const link = path.join(runtimeDir(), "node_modules", ".bin", "claude");
+      if (fs.existsSync(link)) {
+        message =
+          "依赖下载了，但原生二进制没铺开（postinstall 没跑成）。\n" +
+          `手动补一下：node ${path.join(runtimeDir(), "node_modules/@anthropic-ai/claude-code/install.cjs")}`;
+      } else {
+        message =
+          code === 0
+            ? "命令已执行完，但私有运行时里没有 claude"
+            : `安装退出码 ${code}（详情见上方日志）`;
+      }
+    } else {
+      message =
+        code === 0 ? "命令已执行完，但仍没找到 claude 可执行文件" : `安装退出码 ${code}`;
+    }
+    installSend("install:state", { phase: "error", message });
   });
 }
 
@@ -1340,7 +1373,8 @@ async function warnIfClaudeMissing() {
     detail:
       "已检查常见安装位置，也问过你的登录 shell，都没有找到 claude。\n\n" +
       "可以让它自动安装（约 260MB 下载，视网络情况需要几分钟）：\n" +
-      "有 npm 就走 npm，没有就用官方脚本。\n\n" +
+      `有 npm 就装进应用私有目录（${runtimeDir()}），不污染系统；\n` +
+      "没有 npm 才用官方脚本（装到 ~/.local/bin）。\n\n" +
       "也可以自己装：\n" +
       "  npm install -g @anthropic-ai/claude-code\n" +
       "  curl -fsSL https://claude.ai/install.sh | bash",

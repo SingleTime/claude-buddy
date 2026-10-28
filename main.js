@@ -95,17 +95,17 @@ function rescanClaudeBin() {
 }
 
 /**
- * 问一次用户的登录 shell：claude 到底在哪。
+ * 问一次用户的登录 shell：某个命令到底在哪。
  *
  * resolveClaudeBin() 查的是写死的位置列表 + 本进程的 PATH，而 GUI 进程的 PATH
  * 只有 /usr/bin:/bin:/usr/sbin:/sbin。凡是靠版本管理器（nvm / fnm / asdf / volta）
- * 或自定义 PATH 装上的 claude，静态列表都可能漏掉。
+ * 或自定义 PATH 装上的东西，静态列表都可能漏掉。
  *
  * 漏掉时不能让用户再装一份 —— 那会变成全局两份、版本还不知道哪个在前。
  * 所以让登录 shell 自己报出来（它会加载 .zshrc / .bash_profile 里的 PATH）。
  * 只有真的问不到，才认为「本机没有」。
  */
-function probeClaudeViaShell() {
+function probeViaShell(name) {
   return new Promise((resolve) => {
     const shell = process.env.SHELL || safeUserShell() || "/bin/bash";
     let settled = false;
@@ -118,7 +118,7 @@ function probeClaudeViaShell() {
 
     let proc;
     try {
-      proc = spawn(shell, ["-lc", "command -v claude"], {
+      proc = spawn(shell, ["-lc", `command -v ${name}`], {
         env: childEnv(),
         stdio: ["ignore", "pipe", "ignore"],
       });
@@ -163,6 +163,55 @@ function probeClaudeViaShell() {
   });
 }
 
+const probeClaudeViaShell = () => probeViaShell("claude");
+
+/** 跑一条命令拿 stdout（用于问 npm prefix -g 这类一次性查询） */
+function runCapture(cmd, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+
+    const shell = process.env.SHELL || safeUserShell() || "/bin/bash";
+    let proc;
+    try {
+      proc = spawn(shell, ["-lc", cmd], {
+        env: childEnv(),
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      return finish("");
+    }
+
+    const timer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* 已经退出 */
+      }
+      finish("");
+    }, timeoutMs || 10000);
+
+    let out = "";
+    proc.stdout.setEncoding("utf8");
+    proc.stdout.on("data", (c) => {
+      out += c;
+    });
+    proc.on("error", () => {
+      clearTimeout(timer);
+      finish("");
+    });
+    proc.on("close", () => {
+      clearTimeout(timer);
+      finish(out.trim());
+    });
+  });
+}
+
 function safeUserShell() {
   try {
     const s = os.userInfo().shell;
@@ -185,6 +234,31 @@ async function ensureClaude() {
     return found;
   }
   return null;
+}
+
+/**
+ * npm 的全局 bin 目录。
+ *
+ * 不能假定 /usr/local/bin：npm 前缀可能是 homebrew、nvm 的版本目录、
+ * ~/.npm-global，或者用户自己 set 的。问 npm 自己最靠谱。
+ */
+async function npmGlobalBinDir() {
+  const prefix = await runCapture("npm prefix -g");
+  if (!prefix || !prefix.startsWith("/")) return "";
+  return path.join(prefix, "bin");
+}
+
+/**
+ * 默认用哪种方式装。
+ *
+ * 优先 npm：它一次下载 + 硬链接铺开，路径最短；官方脚本还要再调用下载下来的
+ * 那个二进制自己的 `install` 子命令去二次铺开，步骤更多、输出更不可控。
+ *
+ * 但 npm 只在已经装了 Node 时才有意义 —— 没有就退回官方脚本（不依赖 Node）。
+ */
+async function pickInstallMethod() {
+  const npm = await probeViaShell("npm");
+  return npm ? "npm" : "script";
 }
 
 /** 给子进程补齐 PATH，保证 claude 内部调用 node / git / 其它 CLI 也能命中 */
@@ -1084,7 +1158,7 @@ const INSTALL_METHODS = {
 
 let installWin = null;
 let installProc = null;
-let installMethod = "script";
+let installMethod = ""; // 空 = 打开时按环境自动选
 
 function installSend(channel, payload) {
   if (installWin && !installWin.isDestroyed()) installWin.webContents.send(channel, payload);
@@ -1135,12 +1209,20 @@ async function startInstall(method) {
   if (method) installMethod = method;
   if (installProc) return;
 
+  // 先按环境定方式（有 npm 走 npm，没有才走官方脚本），这样界面上显示的
+  // 标签一开始就是真的，不会先显示"官方脚本"再跳成"npm 全局安装"
+  let autoPicked = false;
+  if (!installMethod) {
+    installMethod = await pickInstallMethod();
+    autoPicked = true;
+  }
+
   // 装之前先确认一遍。用户可能已经从别的终端装好了（向导开着的时候），
   // 也可能本来就装着、只是静态列表没探到 —— 这两种都别再装第二份。
   installSend("install:state", {
     phase: "checking",
     method: installMethod,
-    label: (INSTALL_METHODS[installMethod] || INSTALL_METHODS.script).label,
+    label: INSTALL_METHODS[installMethod].label,
     cmd: "",
   });
   installSend("install:log", { stream: "sys", text: "先检查本机是否已安装…" });
@@ -1151,11 +1233,18 @@ async function startInstall(method) {
     installSend("install:state", { phase: "present", bin: existing });
     return;
   }
-  installSend("install:log", { stream: "sys", text: "未检测到，开始安装" });
+
+  if (autoPicked) {
+    installSend("install:log", {
+      stream: "sys",
+      text: installMethod === "npm" ? "检测到 npm，用 npm 安装" : "没装 npm，用官方脚本安装",
+    });
+  }
+  installSend("install:log", { stream: "sys", text: "未检测到 claude，开始安装" });
 
   if (installProc) return;
 
-  const m = INSTALL_METHODS[installMethod] || INSTALL_METHODS.script;
+  const m = INSTALL_METHODS[installMethod];
   installSend("install:state", {
     phase: "running",
     method: installMethod,
@@ -1183,9 +1272,9 @@ async function startInstall(method) {
       } catch {
         /* 已经退出 */
       }
-      installSend("install:log", { stream: "err", text: "超过 5 分钟未完成，已终止" });
+      installSend("install:log", { stream: "err", text: "超过 10 分钟未完成，已终止" });
     },
-    5 * 60 * 1000,
+    10 * 60 * 1000,
   );
 
   const pipe = (stream) => (chunk) => {
@@ -1210,7 +1299,19 @@ async function startInstall(method) {
 
     // 不信任退出码，只认磁盘上真的有没有：curl | bash 会在权限/网络问题下
     // 中途放弃却仍然返回 0。npm 装进版本管理器时也要靠登录 shell 才看得见。
-    const bin = rescanClaudeBin() || (await ensureClaude());
+    let bin = rescanClaudeBin() || (await ensureClaude());
+
+    // 最后一道：直接问 npm 把 bin 放哪了。npm 的 prefix 可能是 homebrew、
+    // nvm 版本目录或自定义位置，登录 shell 的 PATH 里也不一定有
+    if (!bin) {
+      const nb = await npmGlobalBinDir();
+      const cand = nb && path.join(nb, "claude");
+      if (cand && fs.existsSync(cand)) {
+        CLAUDE_BIN = cand;
+        bin = cand;
+      }
+    }
+
     if (bin) {
       installSend("install:log", { stream: "ok", text: `找到 claude：${bin}` });
       installSend("install:state", { phase: "success", bin });
@@ -1238,7 +1339,9 @@ async function warnIfClaudeMissing() {
     message: "Claude Buddy 需要 Claude Code CLI 才能工作",
     detail:
       "已检查常见安装位置，也问过你的登录 shell，都没有找到 claude。\n\n" +
-      "可以让它自动安装（需要联网，通常 1 分钟内完成），也可以自己装：\n" +
+      "可以让它自动安装（约 260MB 下载，视网络情况需要几分钟）：\n" +
+      "有 npm 就走 npm，没有就用官方脚本。\n\n" +
+      "也可以自己装：\n" +
       "  npm install -g @anthropic-ai/claude-code\n" +
       "  curl -fsSL https://claude.ai/install.sh | bash",
     buttons: ["自动安装", "手动安装说明", "稍后"],
@@ -1246,7 +1349,7 @@ async function warnIfClaudeMissing() {
     cancelId: 2,
   });
 
-  if (response === 0) openInstaller("script");
+  if (response === 0) openInstaller();
   else if (response === 1) shell.openExternal("https://claude.com/claude-code");
 }
 

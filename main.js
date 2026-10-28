@@ -94,6 +94,99 @@ function rescanClaudeBin() {
   return claudeReady() ? CLAUDE_BIN : null;
 }
 
+/**
+ * 问一次用户的登录 shell：claude 到底在哪。
+ *
+ * resolveClaudeBin() 查的是写死的位置列表 + 本进程的 PATH，而 GUI 进程的 PATH
+ * 只有 /usr/bin:/bin:/usr/sbin:/sbin。凡是靠版本管理器（nvm / fnm / asdf / volta）
+ * 或自定义 PATH 装上的 claude，静态列表都可能漏掉。
+ *
+ * 漏掉时不能让用户再装一份 —— 那会变成全局两份、版本还不知道哪个在前。
+ * 所以让登录 shell 自己报出来（它会加载 .zshrc / .bash_profile 里的 PATH）。
+ * 只有真的问不到，才认为「本机没有」。
+ */
+function probeClaudeViaShell() {
+  return new Promise((resolve) => {
+    const shell = process.env.SHELL || safeUserShell() || "/bin/bash";
+    let settled = false;
+    const finish = (v) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+
+    let proc;
+    try {
+      proc = spawn(shell, ["-lc", "command -v claude"], {
+        env: childEnv(),
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      return finish(null);
+    }
+
+    // 某些人的 rc 文件里挂着网络请求或慢操作，不能无限等
+    const timer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* 已经退出 */
+      }
+      finish(null);
+    }, 8000);
+
+    let out = "";
+    proc.stdout.setEncoding("utf8");
+    proc.stdout.on("data", (c) => {
+      out += c;
+    });
+    proc.on("error", () => {
+      clearTimeout(timer);
+      finish(null);
+    });
+    proc.on("close", () => {
+      clearTimeout(timer);
+      // command -v 可能返回别名或函数定义，只要绝对路径那一行
+      const found = out
+        .split("\n")
+        .map((s) => s.trim())
+        .find((s) => s.startsWith("/") && !s.includes(" "));
+      if (!found) return finish(null);
+      try {
+        if (fs.statSync(found).isFile()) return finish(found);
+      } catch {
+        /* 报了个不存在的路径 */
+      }
+      finish(null);
+    });
+  });
+}
+
+function safeUserShell() {
+  try {
+    const s = os.userInfo().shell;
+    return s && fs.existsSync(s) ? s : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 确认 claude 是否可用：先看已解析的路径，再问一次登录 shell。
+ * 找到就把 CLAUDE_BIN 换上，后续 spawn 直接用。
+ */
+async function ensureClaude() {
+  if (claudeReady()) return CLAUDE_BIN;
+
+  const found = await probeClaudeViaShell();
+  if (found) {
+    CLAUDE_BIN = found;
+    return found;
+  }
+  return null;
+}
+
 /** 给子进程补齐 PATH，保证 claude 内部调用 node / git / 其它 CLI 也能命中 */
 function childEnv() {
   const extra = [
@@ -955,12 +1048,12 @@ function buildMenu() {
         { label: "安装 Claude Code…", click: () => openInstaller() },
         {
           label: "重新检测 claude",
-          click: () => {
-            const bin = rescanClaudeBin();
+          click: async () => {
+            const bin = (await ensureClaude()) || rescanClaudeBin();
             dialog.showMessageBox(mainWindow, {
               type: bin ? "info" : "warning",
               message: bin ? "已找到 claude" : "仍然没找到 claude",
-              detail: bin || `已尝试：${CLAUDE_BIN}\n可从「帮助 → 安装 Claude Code…」自动安装。`,
+              detail: bin || `已检查常见位置和登录 shell PATH。\n可从「帮助 → 安装 Claude Code…」自动安装。`,
               buttons: ["好"],
             });
           },
@@ -1038,8 +1131,28 @@ function openInstaller(method) {
   });
 }
 
-function startInstall(method) {
+async function startInstall(method) {
   if (method) installMethod = method;
+  if (installProc) return;
+
+  // 装之前先确认一遍。用户可能已经从别的终端装好了（向导开着的时候），
+  // 也可能本来就装着、只是静态列表没探到 —— 这两种都别再装第二份。
+  installSend("install:state", {
+    phase: "checking",
+    method: installMethod,
+    label: (INSTALL_METHODS[installMethod] || INSTALL_METHODS.script).label,
+    cmd: "",
+  });
+  installSend("install:log", { stream: "sys", text: "先检查本机是否已安装…" });
+
+  const existing = await ensureClaude();
+  if (existing) {
+    installSend("install:log", { stream: "ok", text: `已存在：${existing}` });
+    installSend("install:state", { phase: "present", bin: existing });
+    return;
+  }
+  installSend("install:log", { stream: "sys", text: "未检测到，开始安装" });
+
   if (installProc) return;
 
   const m = INSTALL_METHODS[installMethod] || INSTALL_METHODS.script;
@@ -1091,11 +1204,13 @@ function startInstall(method) {
     installSend("install:state", { phase: "error", message: `安装进程启动失败：${e.message}` });
   });
 
-  proc.on("close", (code) => {
+  proc.on("close", async (code) => {
     clearTimeout(timer);
     installProc = null;
 
-    const bin = rescanClaudeBin();
+    // 不信任退出码，只认磁盘上真的有没有：curl | bash 会在权限/网络问题下
+    // 中途放弃却仍然返回 0。npm 装进版本管理器时也要靠登录 shell 才看得见。
+    const bin = rescanClaudeBin() || (await ensureClaude());
     if (bin) {
       installSend("install:log", { stream: "ok", text: `找到 claude：${bin}` });
       installSend("install:state", { phase: "success", bin });
@@ -1113,14 +1228,16 @@ function startInstall(method) {
 
 /** 启动自检：claude 不存在时给出明确指引，避免每条消息都静默失败 */
 async function warnIfClaudeMissing() {
-  if (claudeReady()) return;
+  // 先问一次登录 shell 再决定要不要报缺：装在版本管理器里的 claude
+  // 静态列表看不到，但不代表本机没有 —— 这种情况不该提示用户去装
+  if (await ensureClaude()) return;
 
   const { response } = await dialog.showMessageBox(mainWindow, {
     type: "warning",
     title: "找不到 claude",
     message: "Claude Buddy 需要 Claude Code CLI 才能工作",
     detail:
-      `已尝试的路径：${CLAUDE_BIN}\n\n` +
+      "已检查常见安装位置，也问过你的登录 shell，都没有找到 claude。\n\n" +
       "可以让它自动安装（需要联网，通常 1 分钟内完成），也可以自己装：\n" +
       "  npm install -g @anthropic-ai/claude-code\n" +
       "  curl -fsSL https://claude.ai/install.sh | bash",

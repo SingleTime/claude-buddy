@@ -17,6 +17,7 @@
         --green: #4ade80;
         --red: #f87171;
         --yellow: #fbbf24;
+        --blue: #6aa9ff;
         --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
       }
 
@@ -65,6 +66,11 @@
         border: 1px solid var(--border);
         border-radius: 8px;
         background: var(--bg-2);
+      }
+
+      /* display:flex 会盖掉 hidden 的默认表现，得显式声明 */
+      .cmd-row[hidden] {
+        display: none;
       }
 
       .cmd-row .tag {
@@ -150,6 +156,14 @@
         color: var(--yellow);
       }
 
+      .status.checking {
+        color: var(--text-dim);
+      }
+
+      .status.present {
+        color: var(--blue);
+      }
+
       .status.success {
         color: var(--green);
       }
@@ -213,9 +227,9 @@
     <header>
       <h1>安装 Claude Code</h1>
       <div class="sub">
-        Claude Buddy 只是前端，运行需要 Claude Code CLI。这里会调用官方安装方式，装完自动重新检测。
+        先检查本机是否已经装了，只有确实没有才调用官方方式安装。装完会重新检测并接管。
       </div>
-      <div class="cmd-row">
+      <div class="cmd-row" id="cmdRow">
         <span class="tag" id="methodTag">官方脚本</span>
         <code id="cmd">—</code>
       </div>
@@ -237,6 +251,7 @@
       const logEl = document.getElementById("log");
       const statusEl = document.getElementById("status");
       const cmdEl = document.getElementById("cmd");
+      const cmdRow = document.getElementById("cmdRow");
       const tagEl = document.getElementById("methodTag");
       const btnSwitch = document.getElementById("btnSwitch");
       const btnDocs = document.getElementById("btnDocs");
@@ -262,8 +277,8 @@
         phase = phaseName;
         statusEl.className = "status " + phaseName;
         statusEl.innerHTML = html;
-        const running = phaseName === "running";
-        btnSwitch.disabled = running || phaseName === "success";
+        const busy = phaseName === "running" || phaseName === "checking";
+        btnSwitch.disabled = busy || phaseName === "success" || phaseName === "present";
         btnSwitch.textContent = method === "script" ? "改用 npm" : "改用官方脚本";
       }
 
@@ -279,14 +294,25 @@
           }
           if (s.cmd) cmdEl.textContent = s.cmd;
 
-          if (s.phase === "running") {
+          if (s.phase === "checking") {
+            setStatus("checking", '<span class="spin"></span>正在检查本机是否已安装…');
+            cmdRow.hidden = true; // 还没决定装不装，没命令可显示
+          } else if (s.phase === "running") {
             setStatus("running", '<span class="spin"></span>正在安装，请勿关闭窗口…');
+            cmdRow.hidden = false;
+          } else if (s.phase === "present") {
+            setStatus("present", "本机已装，无需安装：<b>" + s.bin + "</b>");
+            cmdRow.hidden = true;
+            btnClose.textContent = "完成";
+            btnClose.classList.add("primary");
           } else if (s.phase === "success") {
             setStatus("success", "安装完成，已找到 <b>" + s.bin + "</b>。关闭本窗口即可开始对话。");
+            cmdRow.hidden = false;
             btnClose.textContent = "完成";
             btnClose.classList.add("primary");
           } else if (s.phase === "error") {
             setStatus("error", s.message + "（可切换另一种方式重试）");
+            cmdRow.hidden = false;
           }
         });
 
